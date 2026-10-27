@@ -4,7 +4,7 @@ A Claude Code mod for sharing one live chat with friends. Everyone prompts their
 
 - Your prompts and your Claude's replies show on the left, your peers' on the right.
 - "Jason is typing" shows with Jason's avatar and animated dots when a peer types.
-- Avatars are your GitHub picture: found automatically if the `gh` CLI is signed in, or set with `/coop avatar <github-username>` (`/coop avatar none` shows your initial instead).
+- Avatars are your GitHub picture, shrunk to 16×16 pixels: found automatically if the `gh` CLI is signed in, or set with `/coop avatar <github-username>` (`/coop avatar none` shows your initial instead). Fetching a picture needs Windows for now; everyone sees pictures on any system.
 - Before each of your prompts, your Claude is told what your peers' Claudes did since your last turn. Updates over 4,000 characters are condensed by Haiku first, a small extra call on your account.
 - A message box in the pane lets you talk to your Claude from there. Copy a screenshot and press "📎 Paste screenshot", or press "📄 Attach files" to pick files; they go with your next message, with or without text. Peers see the names and screenshot previews. (Windows works out of the box; macOS needs nothing or `pngpaste`; Linux needs `wl-paste` or `xclip`, and `zenity` for the file picker.)
 

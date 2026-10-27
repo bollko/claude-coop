@@ -96,20 +96,49 @@ export const withShots = (text: string, paths: readonly string[]) =>
 const isPreview = (src: string | undefined): src is string =>
   !!src && src.length < 120_000 && /^data:image\/jpeg;base64,[A-Za-z0-9+/=]+$/.test(src)
 
-// Pictures arrive from peers: only a plain base64 PNG or JPEG goes into the SVG markup.
-export const isPicture = (src: unknown): src is string =>
-  typeof src === 'string' && src.length < 45_000 && /^data:image\/(png|jpeg);base64,[A-Za-z0-9+/=]+$/.test(src)
+// A picture is a 16x16 grid of RRGGBB pixels: the desktop's Svg drops embedded images,
+// so avatars are drawn from plain squares. Peers' grids go into markup only in this exact form.
+export const isPicture = (src: unknown): src is string => typeof src === 'string' && /^px16:[0-9a-f]{1536}$/.test(src)
 
-// A person's avatar: their picture in a circle, else their initial on a colour picked from their name.
+const hex = (n: number) => Math.round(n).toString(16).padStart(2, '0')
+
+// A person's avatar: their picture's pixels inside a circle, else their initial on a colour from their name.
 export const avatarSvg = (name: string, picture?: string) => {
   if (isPicture(picture)) {
-    return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><defs><clipPath id="c"><circle cx="12" cy="12" r="12"/></clipPath></defs><image href="${picture}" width="24" height="24" clip-path="url(#c)" preserveAspectRatio="xMidYMid slice"/></svg>`
+    const px = picture.slice(5)
+    let rects = ''
+    for (let y = 0; y < 16; y++) {
+      for (let x = 0; x < 16; x++) {
+        if ((x - 7.5) ** 2 + (y - 7.5) ** 2 > 64) continue
+        rects += `<rect x="${x}" y="${y}" width="1.05" height="1.05" fill="#${px.slice((y * 16 + x) * 6, (y * 16 + x) * 6 + 6)}"/>`
+      }
+    }
+
+    return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" shape-rendering="crispEdges">${rects}</svg>`
   }
+  // A hue from the name, turned into hex (the Svg scrub may drop colour functions such as hsl()).
   const hue = [...name].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 360, 7)
+  const channel = (n: number) => {
+    const k = (n + hue / 30) % 12
+    return 255 * (0.45 - 0.2475 * Math.max(-1, Math.min(k - 3, 9 - k, 1)))
+  }
+  const fill = `#${hex(channel(0))}${hex(channel(8))}${hex(channel(4))}`
   const initial = (name.trim()[0] ?? '?').toUpperCase().replace(/[<>&"']/, '?')
 
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><circle cx="12" cy="12" r="12" fill="hsl(${hue},55%,45%)"/><text x="12" y="16.5" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="600" fill="#fff">${initial}</text></svg>`
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><circle cx="12" cy="12" r="12" fill="${fill}"/><text x="12" y="16.5" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="600" fill="#ffffff">${initial}</text></svg>`
 }
+
+// ponytail: temporary probe for what the desktop's Svg scrub keeps; delete once the answers are in.
+const PNG_DOT = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=='
+const SVG_PROBES: [string, string][] = [
+  ['A hex', '<circle cx="12" cy="12" r="12" fill="#3a8fd9"/>'],
+  ['B hsl', '<circle cx="12" cy="12" r="12" fill="hsl(120,55%,45%)"/>'],
+  ['C text', '<rect width="24" height="24" fill="#555555"/><text x="12" y="17" text-anchor="middle" font-size="14" fill="#ffffff">E</text>'],
+  ['D image', `<image href="data:image/png;base64,${PNG_DOT}" width="24" height="24"/>`],
+  ['E clip', '<defs><clipPath id="c"><circle cx="12" cy="12" r="12"/></clipPath></defs><rect width="24" height="24" fill="#d97757" clip-path="url(#c)"/>'],
+  ['F rects', '<rect width="12" height="12" fill="#ff0000"/><rect x="12" y="12" width="12" height="12" fill="#00ff00"/>'],
+]
+const probe = atom({ plugin: 'claude-coop', key: 'probe' } as const, false)
 
 // Claude's own mark, for the bubbles of Claude's answers.
 const CLAUDE_AVATAR =
@@ -163,7 +192,7 @@ const post = async ($: EngineInterface, kind: PostKind, text = '', images: strin
   }
 }
 
-// --- Your picture: your GitHub avatar, fetched once and kept across sessions in $.store('picture').
+// --- Your picture: your GitHub avatar, fetched once and kept across sessions in $.store('avatarPx').
 
 // `gh` signed in gives your avatar's URL; a username given to /coop avatar gives it too.
 const githubAvatarUrl = async ($: EngineInterface, user?: string) => {
@@ -174,16 +203,21 @@ const githubAvatarUrl = async ($: EngineInterface, user?: string) => {
   return url.startsWith('https://') ? `${url}${url.includes('?') ? '&' : '?'}s=64` : undefined
 }
 
-// $.http.fetch reads bodies as text, so the bytes come down through the OS, as base64.
+// The module can't decode images, so the OS downloads the picture and shrinks it to 16x16 pixels.
+// ponytail: Windows only (System.Drawing); elsewhere people keep their initial. Add a decoder if that matters.
+const PS_PIXELS =
+  'Add-Type -AssemblyName System.Drawing; $b = (Invoke-WebRequest -UseBasicParsing -Uri $env:COOP_URL).Content; ' +
+  '$i = [Drawing.Image]::FromStream((New-Object IO.MemoryStream (,$b))); $t = New-Object Drawing.Bitmap 16, 16; ' +
+  "$g = [Drawing.Graphics]::FromImage($t); $g.InterpolationMode = 'HighQualityBicubic'; $g.DrawImage($i, 0, 0, 16, 16); " +
+  '$s = New-Object Text.StringBuilder; for ($y = 0; $y -lt 16; $y++) { for ($x = 0; $x -lt 16; $x++) { $c = $t.GetPixel($x, $y); ' +
+  "[void]$s.AppendFormat('{0:x2}{1:x2}{2:x2}', $c.R, $c.G, $c.B) } }; $s.ToString()"
+
 const downloadPicture = async ($: EngineInterface, url: string) => {
-  const isWindows = (await $.env.get('OS')) === 'Windows_NT'
-  const argv = isWindows
-    ? ['powershell', '-NoProfile', '-Command', '[Convert]::ToBase64String((Invoke-WebRequest -UseBasicParsing -Uri $env:COOP_URL).Content)']
-    : ['sh', '-c', 'curl -fsSL "$COOP_URL" | base64 | tr -d "\\n"']
-  const res = await $.process.run(argv, { env: { COOP_URL: url }, timeoutMs: 20_000 }).catch(() => undefined)
-  const b64 = res?.exitCode === 0 ? res.stdout.trim() : ''
-  const type = b64.startsWith('iVBOR') ? 'png' : b64.startsWith('/9j/') ? 'jpeg' : undefined
-  const picture = type && `data:image/${type};base64,${b64}`
+  if ((await $.env.get('OS')) !== 'Windows_NT') return undefined
+  const res = await $.process
+    .run(['powershell', '-NoProfile', '-Command', PS_PIXELS], { env: { COOP_URL: url }, timeoutMs: 20_000 })
+    .catch(() => undefined)
+  const picture = res?.exitCode === 0 ? `px16:${res.stdout.trim()}` : undefined
 
   return isPicture(picture) ? picture : undefined
 }
@@ -191,7 +225,7 @@ const downloadPicture = async ($: EngineInterface, url: string) => {
 const fetchPicture = async ($: EngineInterface, user?: string) => {
   const url = await githubAvatarUrl($, user)
   const picture = url && (await downloadPicture($, url))
-  if (picture) await $.store.set('picture', picture)
+  if (picture) await $.store.set('avatarPx', picture)
 
   return picture
 }
@@ -200,14 +234,14 @@ const fetchPicture = async ($: EngineInterface, user?: string) => {
 let lastProfilePost = 0
 const shareProfile = async ($: EngineInterface) => {
   lastProfilePost = Date.now()
-  const picture = (await $.store.get('picture')) as string | undefined
+  const picture = (await $.store.get('avatarPx')) as string | undefined
   await post($, 'profile', isPicture(picture) ? picture : '')
 }
 
 // First time in a room with no picture kept: try gh quietly, then share whatever there is.
 const setupProfile = async ($: EngineInterface) => {
-  if (!(await $.store.get('picture')) && !(await $.store.get('pictureTried'))) {
-    await $.store.set('pictureTried', true)
+  if (!(await $.store.get('avatarPx')) && !(await $.store.get('avatarTried'))) {
+    await $.store.set('avatarTried', true)
     await fetchPicture($)
   }
   await shareProfile($)
@@ -631,11 +665,18 @@ export const register: Register = on => {
     }
     const cfg = await read($, config)
     if (!cfg) return { text: `Not in a room. ${USAGE}` }
+    if (verb === 'svgtest') {
+      const shown = !(await read($, probe))
+      await update($, probe, () => shown)
+      await $.ui.open({ id: PANE, title: 'Co-op' })
+
+      return { text: shown ? 'Drawing test shown at the top of the Co-op pane: which of A–F appear?' : 'Drawing test hidden.' }
+    }
     if (verb === 'avatar') {
       // `/coop avatar <github-username>` uses that account's picture; `none` goes back to initials.
       const user = server
       if (user === 'none') {
-        await $.store.delete('picture')
+        await $.store.delete('avatarPx')
         await shareProfile($)
 
         return { text: 'Avatar cleared: your initial shows instead.' }
@@ -796,6 +837,16 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column" gap={1}>
+        {Svg && (await read($, probe)) && (
+          <Box flexDirection="row" gap={2} flexWrap="wrap">
+            {SVG_PROBES.map(([label, body]) => (
+              <Box flexDirection="column" alignItems="center">
+                <Svg alt={label} width={32} height={32} isInteractive source={`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">${body}</svg>`} />
+                <Text dimColor>{label}</Text>
+              </Box>
+            ))}
+          </Box>
+        )}
         {hosting && (
           <Box flexDirection="column" borderStyle="round" borderColor="magenta" paddingX={1}>
             {hosting.startsWith('/coop join') ? (

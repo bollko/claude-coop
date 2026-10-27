@@ -129,7 +129,7 @@ test('screenshots and picked files go to your Claude as paths, and the room hear
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('ui.status', () => ({ value: undefined }))
-  on('env.get', () => ({ value: 'Windows_NT' }))
+  mock.env(on, { OS: 'Windows_NT' })
   const shot = 'C:/Temp/coop-shot-1.png'
   const picked = ['C:/Work/notes.txt', 'C:/Work/log.csv']
   // The file picker answers two files; the clipboard grab answers a screenshot and its preview.
@@ -290,17 +290,19 @@ test('your GitHub picture goes to the room sealed, and peers show with theirs', 
   const clock = mock.clock(on)
   mock.store(on)
   const keys = await roomKeys('room', 's')
-  const jasonPic = 'data:image/jpeg;base64,/9j/JASON'
+  // Pictures travel as 16x16 RRGGBB grids: Jason's is all one blue, Euan's all one orange.
+  const jasonPic = `px16:${'1f6feb'.repeat(256)}`
+  const euanPx = 'd97757'.repeat(256)
   const profiles = { Jason: await seal(keys, jasonPic) }
   const posts: string[] = []
   on('command.register', () => ({ value: { command: 'coop' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('ui.status', () => ({ value: undefined }))
-  on('env.get', () => ({ value: 'Windows_NT' }))
+  mock.env(on, { OS: 'Windows_NT' })
   on('process.run', (_, e) => {
     const out = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
-    return e.argv[0] === 'gh' ? out('https://avatars.githubusercontent.com/u/1?v=4\n') : out('/9j/EUAN\r\n')
+    return e.argv[0] === 'gh' ? out('https://avatars.githubusercontent.com/u/1?v=4\n') : out(`${euanPx}\r\n`)
   })
   on('http.fetch', async (_, e) => {
     if (e.init?.method === 'POST') posts.push(await opened(e.init.body ?? '', 'room', 's'))
@@ -313,13 +315,13 @@ test('your GitHub picture goes to the room sealed, and peers show with theirs', 
   await clock.advance(1100)
 
   // The relay got Euan's picture sealed; opened, it's the GitHub download.
-  const profile = posts.map(p => JSON.parse(p) as { kind: string; text: string }).find(p => p.kind === 'profile')
+  const profile = posts.map(p => JSON.parse(p) as { kind: string; text: string }).filter(p => p.kind === 'profile').at(-1)
   expect(profile).toBeDefined()
-  expect(await open(keys, profile?.text ?? '')).toBe('data:image/jpeg;base64,/9j/EUAN')
-  expect(raw.some(body => body.includes('/9j/EUAN'))).toBe(false)
+  expect(await open(keys, profile?.text ?? '')).toBe(`px16:${euanPx}`)
+  expect(raw.some(body => body.includes(euanPx))).toBe(false)
 
   const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
   const drawn = JSON.stringify(await pane.find({ type: 'Svg' }))
-  expect(drawn).toContain('/9j/JASON')
+  expect(drawn).toContain('fill=\\"#1f6feb\\"')
   await pane.unmount()
 })

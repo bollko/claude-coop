@@ -19,6 +19,7 @@ declare module 'claude-code' {
       workspace: Workspace | null
       lock: string | null
       invite: string | null
+      probe: boolean
       pictures: Record<string, string>
     }
   }
