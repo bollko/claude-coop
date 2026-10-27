@@ -16,7 +16,7 @@ const send = (res, status, body) => {
   res.end(JSON.stringify(body))
 }
 
-createServer(async (req, res) => {
+const server = createServer(async (req, res) => {
   const url = new URL(req.url, 'http://relay')
   const name = url.pathname.match(/^\/rooms\/([\w-]{1,64})$/)?.[1]
   if (!name) return send(res, 404, { error: 'use /rooms/<room>' })
@@ -64,7 +64,7 @@ createServer(async (req, res) => {
   }
   // The room's shared workspace: a git URL everyone works from.
   if (kind === 'repo') {
-    if (text.length > 500) return send(res, 400, { error: 'repo URL too long' })
+    if (text.length > 4000) return send(res, 400, { error: 'repo URL too long' })
     room.repo = text || undefined
     return send(res, 200, {})
   }
@@ -82,4 +82,9 @@ createServer(async (req, res) => {
   room.typing.delete(from)
   room.events.push({ seq: room.events.length + 1, from, kind, text, at: Date.now(), ...(images.length && { images }) })
   send(res, 200, { seq: room.events.length })
-}).listen(Number(process.env.PORT) || 8787, () => console.log(`coop relay on :${Number(process.env.PORT) || 8787}`))
+})
+// PORT=0 picks a free port; the line printed names the one taken (`/coop host` reads it).
+server.listen(process.env.PORT === undefined ? 8787 : Number(process.env.PORT), () =>
+  console.log(`coop relay on :${server.address().port}`),
+)
+

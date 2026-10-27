@@ -18,6 +18,7 @@ declare module 'claude-code' {
       shots: Attachment[]
       workspace: Workspace | null
       lock: string | null
+      invite: string | null
     }
   }
 }

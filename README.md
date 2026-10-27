@@ -25,29 +25,43 @@ claude plugin install claude-coop --marketplace bollko/claude-coop
 
 In the desktop app, where `/plugin` does not run: click + next to the prompt box, then Plugins, Add marketplace with `bollko/claude-coop`, then Add plugin.
 
-## Run a relay
+## Host a room (free, no server needed)
 
-One person runs the relay, a small Node server with no dependencies (Node 18 or later):
+```
+/coop host <your-name> [repo-url]
+```
+
+Your PC runs the relay, and a free tunnel through [localhost.run](https://localhost.run) gives it a public address, using the `ssh` that Windows 10/11, macOS and Linux already have. No account, port forwarding or Tailscale. The Co-op pane shows an invite with a **Copy invite** button; send it to your friends, who put their own name at the end:
+
+```
+/coop join https://abc123.lhr.life room-x7k2pq <secret> Jason
+```
+
+Hosting needs [Node.js](https://nodejs.org). The room lasts while your Claude session runs, and each `/coop host` gives a new address and secret.
+
+## Run your own relay
+
+The relay is one Node file with no dependencies (Node 18 or later). Run it on any server you have:
 
 ```bash
 git clone https://github.com/bollko/claude-coop
 node claude-coop/relay/server.mjs
 ```
 
-It listens on port 8787 (set `PORT` to change it). Others need to reach that machine, for example over Tailscale, or behind an HTTPS tunnel such as Cloudflare Tunnel. Plain HTTP sends the room secret unencrypted, so use it only on a network you trust.
-
-Rooms live in memory: restarting the relay clears them.
-
-## Join a room
+It listens on port 8787 (set `PORT` to change it). Put HTTPS in front of it (Caddy, nginx) and everyone joins with your address:
 
 ```
 /coop join <relay-url> <room> <secret> <your-name>
 ```
 
-For example `/coop join http://192.168.1.20:8787 myroom tacos42 Jason`. The first person to join a room creates it and sets its secret; everyone else uses the same room name and secret. Pick a made-up secret, not a real password.
+The first person to join a room creates it; everyone else uses the same room name and secret. Rooms live in memory: restarting the relay clears them.
+
+## Privacy
+
+Messages, screenshot previews and the room's repo URL are encrypted with a key made from the room name and secret before they leave your PC. The relay, and any tunnel in front of it, sees only ciphertext, plus names, who is typing and who holds the edit lock. It never receives the secret itself. A weak secret can be guessed offline, so use a long random one (`/coop host` makes one for you).
 
 - `/coop` opens the pane again.
-- `/coop leave` leaves the room.
+- `/coop leave` leaves the room (and stops hosting).
 
 ## Shared files
 
@@ -68,5 +82,5 @@ or later, `/coop repo <repo-url>` (`/coop repo none` clears it). Everyone else p
 ## Limits
 
 - The pane polls the relay once a second.
-- Each person's Claude edits files on their own machine; share a project through git yourselves.
+- Everyone in a room needs this version (0.3.0) or later: older versions don't encrypt.
 - On mobile the pane has no message box; use the main prompt box.

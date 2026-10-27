@@ -1,5 +1,18 @@
 import { expect, mock, test } from 'claude-code/testing'
 
+import { isSealed, open, roomKeys } from '../hooks/crypto'
+
+// What the relay was sent, opened as a room member would; raw keeps what it actually saw.
+const raw: string[] = []
+const opened = async (body: string, room: string, secret: string) => {
+  raw.push(body)
+  const ev = JSON.parse(body) as { from: string; kind: string; text: string }
+  if (!isSealed(ev.text)) return body
+  const plain = JSON.parse((await open(await roomKeys(room, secret), ev.text)) ?? '{}') as { text: string; images: string[] }
+
+  return JSON.stringify(plain.images.length ? { ...ev, text: plain.text, images: plain.images } : { ...ev, text: plain.text })
+}
+
 const PANE = {
   plugin: 'claude-coop',
   component: 'Pane',
@@ -22,8 +35,8 @@ test("pane shows bubbles and who is typing; peers' turns reach your Claude once"
   on('command.register', () => ({ value: { command: 'coop' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
-  on('http.fetch', (_, e) => {
-    if (e.init?.method === 'POST') posts.push(e.init.body ?? '')
+  on('http.fetch', async (_, e) => {
+    if (e.init?.method === 'POST') posts.push(await opened(e.init.body ?? '', 'room', 's3cret'))
     return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(e.init?.method === 'POST' ? {} : ROOM) } }
   })
   let context: readonly string[] | undefined
@@ -68,6 +81,8 @@ test("pane shows bubbles and who is typing; peers' turns reach your Claude once"
   // The pane send already caught this Claude up.
   expect(context).toBeUndefined()
   expect(promptPosts('now add logout')).toHaveLength(1)
+  // The relay itself only ever saw ciphertext.
+  expect(raw.some(body => body.includes('hello from the pane') || body.includes('now add logout'))).toBe(false)
 })
 
 test('a large room update reaches your Claude condensed by Haiku', async ($, on) => {
@@ -126,8 +141,8 @@ test('screenshots and picked files go to your Claude as paths, and the room hear
       isStderrTruncated: false,
     },
   }))
-  on('http.fetch', (_, e) => {
-    if (e.init?.method === 'POST') posts.push(e.init.body ?? '')
+  on('http.fetch', async (_, e) => {
+    if (e.init?.method === 'POST') posts.push(await opened(e.init.body ?? '', 'room', 's'))
     return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(e.init?.method === 'POST' ? {} : { events: [], typing: [] }) } }
   })
   let submitted = ''
@@ -224,4 +239,48 @@ test('with a room repo: the folder moves to the room branch, turns pull then pus
   lockHolder = 'Jason'
   const res = await $.prompt.submit({ text: 'rename the button', wait: false, origin: { kind: 'composer' } })
   expect(res).toEqual({ drop: "Jason's Claude is editing the shared files. Send again when it finishes." })
+})
+
+test('/coop host starts the relay and a tunnel, then offers an invite to copy', async ($, on) => {
+  const clock = mock.clock(on)
+  mock.store(on)
+  const fetched: string[] = []
+  let copied = ''
+  let finish = () => {}
+  const running = new Promise<void>(resolve => (finish = resolve))
+  on('command.register', () => ({ value: { command: 'coop' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('ui.status', () => ({ value: undefined }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.copy', (_, e) => ((copied = e.text), { value: { isCopied: true as const } }))
+  on('http.fetch', (_, e) => {
+    fetched.push(e.url)
+    return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ events: [], typing: [], total: 0 }) } }
+  })
+  // Both children stay up until the test ends, as real ones would.
+  on('process.spawn', async function* (_, e) {
+    if (e.argv[0] === 'node') yield { stream: 'stdout' as const, text: 'coop relay on :5555\n' }
+    else {
+      yield { stream: 'stdout' as const, text: '\r\n===\r\nabc123.lhr.life tunneled with tls termination, ' }
+      yield { stream: 'stdout' as const, text: 'https://abc123.lhr.life\r\n' }
+    }
+    await running
+
+    return { value: { code: 0, signal: null } }
+  })
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.command.run({ command: 'coop', args: 'host Euan', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 120 } })
+  await clock.advance(1100)
+
+  // The host talks to its own relay directly.
+  expect(fetched.some(url => url.startsWith('http://localhost:5555/rooms/room-'))).toBe(true)
+  const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const line = await pane.find({ type: 'Text', text: /^\/coop join https:\/\/abc123\.lhr\.life room-\w+ \w{18} <your-name>$/ })
+  expect(line).toBeDefined()
+  await pane.press({ key: 'copy-invite' })
+  expect(copied).toBe(line?.text ?? 'missing')
+  await pane.unmount()
+  finish()
 })

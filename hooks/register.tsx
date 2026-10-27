@@ -2,10 +2,12 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { Attachment, CoopConfig, CoopEvent } from '../types'
+import { isSealed, open, roomKeys, seal } from './crypto'
+import type { RoomKeys } from './crypto'
 
 const PANE = 'coop'
 const USAGE =
-  '/coop join <server-url> <room> <secret> <your-name> [repo-url]  |  /coop repo <url|none>  |  /coop ship  |  /coop leave  |  /coop'
+  '/coop host <your-name> [repo-url]  |  /coop join <server-url> <room> <secret> <your-name> [repo-url]  |  /coop repo <url|none>  |  /coop ship  |  /coop leave  |  /coop'
 const config = atom({ plugin: 'claude-coop', key: 'config' } as const, null)
 const events = atom({ plugin: 'claude-coop', key: 'events' } as const, [])
 const typing = atom({ plugin: 'claude-coop', key: 'typing' } as const, [])
@@ -15,6 +17,8 @@ const sent = atom({ plugin: 'claude-coop', key: 'sent' } as const, 0)
 // The room's repo as this folder stands with it, and who holds the edit lock.
 const workspace = atom({ plugin: 'claude-coop', key: 'workspace' } as const, null)
 const lock = atom({ plugin: 'claude-coop', key: 'lock' } as const, null)
+// While hosting: the join line to hand friends, or what hosting is doing now.
+const invite = atom({ plugin: 'claude-coop', key: 'invite' } as const, null)
 // Screenshots and files waiting to go with the next pane message.
 const shots = atom({ plugin: 'claude-coop', key: 'shots' } as const, [])
 
@@ -98,19 +102,128 @@ const roomUrl = (cfg: CoopConfig) => `${cfg.server.replace(/\/+$/, '')}/rooms/${
 
 type PostKind = 'prompt' | 'answer' | 'typing' | 'repo' | 'lock' | 'unlock'
 
+let cachedKeys: { id: string; keys: Promise<RoomKeys> } | undefined
+const keysFor = (cfg: CoopConfig) => {
+  const id = `${cfg.room}\n${cfg.secret}`
+  if (cachedKeys?.id !== id) cachedKeys = { id, keys: roomKeys(cfg.room, cfg.secret) }
+
+  return cachedKeys.keys
+}
+
 const post = async ($: EngineInterface, kind: PostKind, text = '', images: string[] = []) => {
   const cfg = await read($, config)
   if (!cfg) return undefined
+  const keys = await keysFor(cfg)
+  // Messages (with their previews) and the repo URL travel sealed; names, typing and the lock don't.
+  const body =
+    kind === 'prompt' || kind === 'answer'
+      ? { from: cfg.name, kind, text: await seal(keys, JSON.stringify({ text, images })) }
+      : { from: cfg.name, kind, text: kind === 'repo' && text ? await seal(keys, text) : text }
   try {
     return await $.http.fetch(roomUrl(cfg), {
       method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-coop-secret': cfg.secret },
-      body: JSON.stringify(images.length ? { from: cfg.name, kind, text, images } : { from: cfg.name, kind, text }),
+      headers: { 'content-type': 'application/json', 'x-coop-secret': keys.access },
+      body: JSON.stringify(body),
     })
   } catch {
     $.ui.status('coop: relay unreachable')
     return undefined
   }
+}
+
+// --- Hosting: this PC runs the relay, and a free localhost.run tunnel (over the ssh the OS ships) makes it public.
+
+// The relay and tunnel children; ending their streams ends them.
+let hosted: { relay: AsyncIterator<unknown>; tunnel?: AsyncIterator<unknown> } | undefined
+
+const stopHosting = async ($: EngineInterface) => {
+  const was = hosted
+  hosted = undefined
+  await was?.tunnel?.return?.()
+  await was?.relay.return?.()
+  await update($, invite, () => null)
+}
+
+// Reads a child's output until `match` finds what it waits for; undefined if the child ends first.
+const readUntil = async (it: AsyncIterator<{ text: string }>, match: (out: string) => string | undefined) => {
+  let out = ''
+  for (;;) {
+    const piece = await it.next()
+    if (piece.done) return { found: undefined, out }
+    out += piece.value.text
+    const found = match(out)
+    if (found) return { found, out }
+  }
+}
+
+// Keeps reading a child that was started for the session, then says when it ends.
+// The end can come as the module unloads, when its state calls fail: those are let go.
+const drain = (it: AsyncIterator<unknown>, onEnd: () => Promise<unknown>) =>
+  void (async () => {
+    while (!(await it.next().catch(() => ({ done: true }))).done);
+    await onEnd()
+  })().catch(() => {})
+
+export const tunnelUrl = (out: string) =>
+  out.match(/https:\/\/[a-z0-9-]+\.lhr\.life/i)?.[0] ??
+  out.match(/https:\/\/(?!admin\.)[a-z0-9.-]+\.localhost\.run\b/i)?.[0]
+
+// A secret nobody guesses: the room's messages are only as private as it.
+const randomSecret = () =>
+  [...crypto.getRandomValues(new Uint8Array(18))].map(b => 'abcdefghjkmnpqrstuvwxyz23456789'[b % 31]).join('')
+
+const startHosting = async ($: EngineInterface, name: string, repo?: string) => {
+  await stopHosting($)
+  const room = `room-${randomSecret().slice(0, 6)}`
+  const secret = randomSecret()
+  await update($, invite, () => 'Starting your relay…')
+  const relay = $.process.spawn({ argv: ['node', `${$.plugin.root}/relay/server.mjs`], env: { PORT: '0' } })[Symbol.asyncIterator]()
+  const started = await readUntil(relay, out => out.match(/coop relay on :(\d+)/)?.[1]).catch(() => undefined)
+  if (!started?.found) {
+    await update($, invite, () => null)
+    return $.ui.toast("coop: couldn't start the relay. /coop host needs Node.js installed (nodejs.org).")
+  }
+  hosted = { relay }
+  drain(relay, async () => {
+    if (hosted?.relay !== relay) return
+    await stopHosting($)
+    $.ui.toast('coop: your relay stopped.')
+  })
+
+  // You reach your own relay directly; friends come in through the tunnel.
+  const cfg = { server: `http://localhost:${started.found}`, room, secret, name }
+  await update($, config, () => cfg)
+  await update($, events, () => [])
+  await update($, fed, () => 0)
+  await update($, workspace, () => null)
+  if (repo) await post($, 'repo', repo)
+
+  await update($, invite, () => 'Opening a public tunnel through localhost.run…')
+  const tunnel = $.process
+    .spawn({
+      argv: [
+        'ssh',
+        '-o', 'StrictHostKeyChecking=accept-new',
+        '-o', 'ServerAliveInterval=30',
+        '-o', 'ExitOnForwardFailure=yes',
+        '-T', '-R', `80:localhost:${started.found}`, 'nokey@localhost.run',
+      ],
+    })
+    [Symbol.asyncIterator]()
+  hosted.tunnel = tunnel
+  const opened = await readUntil(tunnel, tunnelUrl).catch(() => undefined)
+  if (!opened?.found) {
+    await update($, invite, () => null)
+    const why = opened?.out.trim().split('\n').at(-1) ?? 'ssh could not start'
+    return $.ui.toast(`coop: the tunnel didn't open (${why}). Friends can't reach your relay; you can still use the room yourself.`)
+  }
+  drain(tunnel, async () => {
+    if (hosted?.tunnel !== tunnel) return
+    await update($, invite, () => null)
+    $.ui.toast('coop: the tunnel closed, so friends lost the room. Run /coop host again for a new invite.')
+  })
+  await update($, invite, () => `/coop join ${opened.found} ${room} ${secret} <your-name>`)
+  $.ui.toast('coop: your room is live. Copy the invite from the Co-op pane.')
 }
 
 // --- Shared workspace: the room's git repo, worked on a branch of the room's own.
@@ -230,6 +343,16 @@ const markTyping = ($: EngineInterface) => {
   void post($, 'typing')
 }
 
+// A sealed message back to its text and previews; one that won't open says so rather than vanish.
+const openEvent = async (keys: RoomKeys, m: CoopEvent): Promise<CoopEvent> => {
+  if (!isSealed(m.text)) return m
+  const plain = await open(keys, m.text)
+  if (plain === undefined) return { ...m, text: "[couldn't decrypt: a different room secret?]" }
+  const { text, images } = JSON.parse(plain) as { text: string; images?: string[] }
+
+  return images?.length ? { ...m, text, images } : { ...m, text }
+}
+
 let isPolling = false
 // ponytail: 1 s polling; switch the relay to SSE or WebSocket if the lag or request count matters.
 const poll = async ($: EngineInterface) => {
@@ -238,7 +361,8 @@ const poll = async ($: EngineInterface) => {
   isPolling = true
   try {
     const since = (await read($, events)).length
-    const res = await $.http.fetch(`${roomUrl(cfg)}?since=${since}`, { headers: { 'x-coop-secret': cfg.secret } })
+    const keys = await keysFor(cfg)
+    const res = await $.http.fetch(`${roomUrl(cfg)}?since=${since}`, { headers: { 'x-coop-secret': keys.access } })
     if (!res.ok) return $.ui.status(`coop: relay said ${res.status}`)
     $.ui.status(`coop: ${cfg.room}`)
     const body = JSON.parse(res.text) as {
@@ -248,7 +372,8 @@ const poll = async ($: EngineInterface) => {
       repo?: string | null
       lock?: string | null
     }
-    await syncWorkspace($, body.repo ?? null, cfg.room)
+    const repo = body.repo && isSealed(body.repo) ? ((await open(keys, body.repo)) ?? null) : (body.repo ?? null)
+    await syncWorkspace($, repo, cfg.room)
     const holder = body.lock ?? null
     if (holder !== (await read($, lock))) await update($, lock, () => holder)
     // Keep the lock alive through a long turn; the relay frees one left for 15 minutes.
@@ -264,7 +389,10 @@ const poll = async ($: EngineInterface) => {
       await update($, fed, () => 0)
       return
     }
-    if (body.events.length) await update($, events, list => (list.length === since ? [...list, ...body.events] : list))
+    if (body.events.length) {
+      const opened = await Promise.all(body.events.map(m => openEvent(keys, m)))
+      await update($, events, list => (list.length === since ? [...list, ...opened] : list))
+    }
     const who = body.typing.filter(name => name !== cfg.name)
     if (who.join() !== (await read($, typing)).join()) await update($, typing, () => who)
   } catch {
@@ -363,7 +491,18 @@ export const register: Register = on => {
 
   on('command.run', { command: 'coop' }, async ($, e) => {
     const [verb, server, room, secret, name, repo] = e.args.trim().split(/\s+/)
+    if (verb === 'host') {
+      // `/coop host <your-name> [repo-url]`: the words after host land in server and room.
+      const [hostName, hostRepo] = [server, room]
+      if (!hostName) return { text: `Usage: /coop host <your-name> [repo-url]` }
+      // Setting up takes a while (the tunnel especially), so it runs on after this answer.
+      void startHosting($, hostName, hostRepo)
+      await $.ui.open({ id: PANE, title: 'Co-op: hosting' })
+
+      return { text: 'Starting your relay and a free public tunnel. The invite to send friends appears in the Co-op pane.' }
+    }
     if (verb === 'leave') {
+      await stopHosting($)
       await $.store.delete('config')
       await update($, config, () => null)
       await update($, events, () => [])
@@ -473,6 +612,16 @@ export const register: Register = on => {
     return { element: e.element }
   })
 
+  on('ui.press', { plugin: 'claude-coop', element: 'copy-invite' }, async ($, e) => {
+    const line = await read($, invite)
+    if (line?.startsWith('/coop join')) {
+      const copied = await $.ui.copy({ text: line, surface: e.surface })
+      $.ui.toast(copied.isCopied ? 'Invite copied. Send it to your friends.' : "Couldn't copy; select the invite text instead.")
+    }
+
+    return { element: e.element }
+  })
+
   on('ui.press', { plugin: 'claude-coop', element: 'clear-shots' }, async ($, e) => {
     await update($, shots, () => [])
 
@@ -482,7 +631,11 @@ export const register: Register = on => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
     const cfg = await read($, config)
-    if (!cfg) return <Text dimColor>Not in a room. {USAGE}</Text>
+    if (!cfg) {
+      const starting = await read($, invite)
+
+      return <Text dimColor>{starting ?? `Not in a room. ${USAGE}`}</Text>
+    }
     const list = await read($, events)
     const who = await read($, typing)
     // A new key per send draws a fresh, empty field; the same key keeps what was typed.
@@ -519,9 +672,23 @@ export const register: Register = on => {
 
     const ws = await read($, workspace)
     const holder = await read($, lock)
+    const hosting = await read($, invite)
 
     return (
       <Box flexDirection="column" gap={1}>
+        {hosting && (
+          <Box flexDirection="column" borderStyle="round" borderColor="magenta" paddingX={1}>
+            {hosting.startsWith('/coop join') ? (
+              <>
+                <Text bold>You're hosting. Send friends this, with their own name at the end:</Text>
+                <Text>{hosting}</Text>
+                <Button key="copy-invite" label="Copy invite" onPress={() => {}} />
+              </>
+            ) : (
+              <Text dimColor>{hosting}</Text>
+            )}
+          </Box>
+        )}
         {ws && (
           <Text dimColor={ws.ok} color={ws.ok ? undefined : 'yellow'}>
             📁 {ws.repo} · {ws.note}
