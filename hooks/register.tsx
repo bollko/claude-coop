@@ -233,23 +233,25 @@ export const register: Register = on => {
   })
 
   // The pane's message box: typing marks you as typing, Enter sends to your Claude.
-  on('ui.input', { plugin: 'claude-coop', element: 'ask' }, async ($, e, next) => {
+  // These hooks answer for themselves: their writes redraw the pane, which drops
+  // the element's own (empty) handler, so passing on to it would throw.
+  on('ui.input', { plugin: 'claude-coop', element: 'ask' }, async ($, e) => {
     if (e.kind !== 'submit') markTyping($)
     else if (e.value.trim()) await sendFromPane($, e.value)
 
-    return next(e)
+    return { element: e.element, value: e.value }
   })
 
-  on('ui.press', { plugin: 'claude-coop', element: 'paste' }, async ($, e, next) => {
+  on('ui.press', { plugin: 'claude-coop', element: 'paste' }, async ($, e) => {
     await attachScreenshot($)
 
-    return next(e)
+    return { element: e.element }
   })
 
-  on('ui.press', { plugin: 'claude-coop', element: 'clear-shots' }, async ($, e, next) => {
+  on('ui.press', { plugin: 'claude-coop', element: 'clear-shots' }, async ($, e) => {
     await update($, shots, () => [])
 
-    return next(e)
+    return { element: e.element }
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
