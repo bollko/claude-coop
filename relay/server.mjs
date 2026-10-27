@@ -5,7 +5,7 @@ import { createServer } from 'node:http'
 const TYPING_MS = 4000
 // A Claude editing the shared files holds the lock; one that vanishes loses it after this.
 const LOCK_MS = 15 * 60_000
-const KINDS = new Set(['prompt', 'answer', 'typing', 'repo', 'lock', 'unlock', 'profile'])
+const KINDS = new Set(['prompt', 'answer', 'note', 'typing', 'repo', 'lock', 'unlock', 'profile'])
 // ponytail: in-memory rooms, lost on restart; add a JSON file or SQLite when rooms must persist.
 const rooms = new Map()
 

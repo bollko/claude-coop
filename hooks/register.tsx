@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Attachment, CoopConfig, CoopEvent } from '../types'
+import type { Attachment, CoopConfig, CoopEvent, SavedRoom, UsageView } from '../types'
 import { isSealed, open, roomKeys, seal } from './crypto'
 import type { RoomKeys } from './crypto'
 
@@ -17,6 +17,10 @@ const sent = atom({ plugin: 'claude-coop', key: 'sent' } as const, 0)
 // The room's repo as this folder stands with it, and who holds the edit lock.
 const workspace = atom({ plugin: 'claude-coop', key: 'workspace' } as const, null)
 const lock = atom({ plugin: 'claude-coop', key: 'lock' } as const, null)
+// The message a note is being written on, the history view when open, and the usage figures.
+const noteFor = atom({ plugin: 'claude-coop', key: 'noteFor' } as const, null)
+const history = atom({ plugin: 'claude-coop', key: 'history' } as const, null)
+const usage = atom({ plugin: 'claude-coop', key: 'usage' } as const, null)
 // Everyone's picture by name, opened from the relay's sealed copies.
 const pictures = atom({ plugin: 'claude-coop', key: 'pictures' } as const, {})
 // While hosting: the join line to hand friends, or what hosting is doing now.
@@ -173,7 +177,7 @@ export const previewSvg = (src: string) => {
 
 const roomUrl = (cfg: CoopConfig) => `${cfg.server.replace(/\/+$/, '')}/rooms/${encodeURIComponent(cfg.room)}`
 
-type PostKind = 'prompt' | 'answer' | 'typing' | 'repo' | 'lock' | 'unlock' | 'profile'
+type PostKind = 'prompt' | 'answer' | 'note' | 'typing' | 'repo' | 'lock' | 'unlock' | 'profile'
 
 let cachedKeys: { id: string; keys: Promise<RoomKeys> } | undefined
 const keysFor = (cfg: CoopConfig) => {
@@ -183,14 +187,14 @@ const keysFor = (cfg: CoopConfig) => {
   return cachedKeys.keys
 }
 
-const post = async ($: EngineInterface, kind: PostKind, text = '', images: string[] = []) => {
+const post = async ($: EngineInterface, kind: PostKind, text = '', images: string[] = [], ref?: number) => {
   const cfg = await read($, config)
   if (!cfg) return undefined
   const keys = await keysFor(cfg)
-  // Messages (with their previews) and the repo URL travel sealed; names, typing and the lock don't.
+  // Messages (with their previews), notes, pictures and the repo URL travel sealed; names, typing and the lock don't.
   const body =
-    kind === 'prompt' || kind === 'answer'
-      ? { from: cfg.name, kind, text: await seal(keys, JSON.stringify({ text, images })) }
+    kind === 'prompt' || kind === 'answer' || kind === 'note'
+      ? { from: cfg.name, kind, text: await seal(keys, JSON.stringify(ref === undefined ? { text, images } : { text, images, ref })) }
       : { from: cfg.name, kind, text: (kind === 'repo' || kind === 'profile') && text ? await seal(keys, text) : text }
   try {
     return await $.http.fetch(roomUrl(cfg), {
@@ -492,9 +496,72 @@ const openEvent = async (keys: RoomKeys, m: CoopEvent): Promise<CoopEvent> => {
   if (!isSealed(m.text)) return m
   const plain = await open(keys, m.text)
   if (plain === undefined) return { ...m, text: "[couldn't decrypt: a different room secret?]" }
-  const { text, images } = JSON.parse(plain) as { text: string; images?: string[] }
+  const { text, images, ref } = JSON.parse(plain) as { text: string; images?: string[]; ref?: number }
 
-  return images?.length ? { ...m, text, images } : { ...m, text }
+  return { ...m, text, ...(images?.length && { images }), ...(typeof ref === 'number' && { ref }) }
+}
+
+// --- History: every room's messages saved as a file of yours, readable after the relay is gone.
+
+const historyDir = async ($: EngineInterface) => {
+  const home = (await $.env.get('USERPROFILE')) ?? (await $.env.get('HOME'))
+
+  return home ? `${home}/.claude/coop-history` : undefined
+}
+
+// ponytail: rewrites the room's whole file on each new batch; fine for chat-sized rooms.
+const saveHistory = async ($: EngineInterface, cfg: CoopConfig, list: CoopEvent[]) => {
+  const dir = await historyDir($)
+  if (!dir || !list.length) return
+  const file = `${dir}/${cfg.room.replace(/[^\w-]/g, '_')}.json`
+  await $.fs.write(file, JSON.stringify({ room: cfg.room, me: cfg.name, savedAt: Date.now(), events: list })).catch(() => {})
+}
+
+const listHistory = async ($: EngineInterface): Promise<SavedRoom[]> => {
+  const dir = await historyDir($)
+  const entries = dir ? await $.fs.list(dir).catch(() => []) : []
+  const rooms: SavedRoom[] = []
+  for (const entry of entries.filter(f => f.kind === 'file' && f.name.endsWith('.json'))) {
+    const saved = await readSaved($, `${dir}/${entry.name}`)
+    if (saved) rooms.push({ file: entry.name, room: saved.room, savedAt: saved.savedAt, count: saved.events.length })
+  }
+
+  return rooms.sort((a, b) => b.savedAt - a.savedAt)
+}
+
+const readSaved = async ($: EngineInterface, path: string) => {
+  const text = await $.fs.read(path).catch(() => undefined)
+  try {
+    return text === undefined ? undefined : (JSON.parse(String(text)) as { room: string; me: string; savedAt: number; events: CoopEvent[] })
+  } catch {
+    return undefined
+  }
+}
+
+// --- Usage: the status line's figures, refreshed whenever the engine measures the session.
+
+const refreshUsage = async ($: EngineInterface) => {
+  const u = await $.session.usage().catch(() => undefined)
+  if (!u) return
+  await update($, usage, () => ({
+    percent: u.context.percent,
+    tokens: u.context.tokens,
+    window: u.context.window,
+    limits: u.rateLimits.map(l => ({ kind: l.kind, percentUsed: l.percentUsed, resetsAt: l.resetsAt })),
+    usd: u.cost?.usd,
+  }))
+}
+
+export const usageLine = (u: UsageView) => {
+  const k = (n: number) => (n >= 1000 ? `${Math.round(n / 1000)}k` : String(n))
+  const names: Record<string, string> = { five_hour: '5-hour limit', seven_day: 'weekly limit', spend_limit: 'spend limit' }
+  const parts = [
+    u.percent === undefined ? `Context: ${k(u.window)} window` : `Context ${u.percent}% (${k(u.tokens ?? 0)} / ${k(u.window)})`,
+    ...u.limits.map(l => `${names[l.kind] ?? l.kind} ${l.percentUsed}%`),
+    ...(u.usd === undefined ? [] : [`$${u.usd.toFixed(2)} this session`]),
+  ]
+
+  return parts.join('  ·  ')
 }
 
 let isPolling = false
@@ -538,6 +605,8 @@ const poll = async ($: EngineInterface) => {
     if (body.events.length) {
       const opened = await Promise.all(body.events.map(m => openEvent(keys, m)))
       await update($, events, list => (list.length === since ? [...list, ...opened] : list))
+      // A failed save (no home folder, a full disk) must not stop the rest of this poll.
+      await saveHistory($, cfg, await read($, events)).catch(() => {})
     }
     const who = body.typing.filter(name => name !== cfg.name)
     if (who.join() !== (await read($, typing)).join()) await update($, typing, () => who)
@@ -553,7 +622,11 @@ export const missedContext = (list: CoopEvent[], from: number, me: string, room:
   const missed = list.slice(from).filter(m => m.from !== me).slice(-40)
   if (!missed.length) return undefined
   const lines = missed.map(m =>
-    m.kind === 'prompt' ? `${m.from} asked their Claude:\n${m.text}` : `${m.from}'s Claude answered:\n${m.text}`,
+    m.kind === 'prompt'
+      ? `${m.from} asked their Claude:\n${m.text}`
+      : m.kind === 'note'
+        ? `${m.from} added a note to message #${m.ref}: ${m.text}`
+        : `${m.from}'s Claude answered:\n${m.text}`,
   )
 
   return `Co-op room "${room}". Your user ${me} shares this chat with peers who run their own Claude sessions. What happened in the room since your last turn:\n\n${lines.join('\n\n---\n\n')}`
@@ -631,6 +704,7 @@ export const register: Register = on => {
     if (saved && !(await read($, config))) await update($, config, () => saved)
     if (saved) void $.ui.open({ id: PANE, title: `Co-op: ${saved.room}` })
     $.clock.every(1000, () => void poll($))
+    void refreshUsage($)
 
     return next(e)
   })
@@ -677,6 +751,13 @@ export const register: Register = on => {
     }
     const cfg = await read($, config)
     if (!cfg) return { text: `Not in a room. ${USAGE}` }
+    if (verb === 'history') {
+      const rooms = await listHistory($)
+      await update($, history, () => ({ mode: 'list' as const, rooms }))
+      await $.ui.open({ id: PANE, title: 'Co-op: history' })
+
+      return { text: rooms.length ? `${rooms.length} saved room(s) in the Co-op pane.` : 'No saved rooms yet.' }
+    }
     if (verb === 'avatar') {
       // `/coop avatar <github-username>` uses that account's picture; `none` goes back to initials.
       const user = server
@@ -787,6 +868,45 @@ export const register: Register = on => {
     return { element: e.element }
   })
 
+  on('session.measure', async ($, e, next) => {
+    const result = await next(e)
+    await refreshUsage($)
+
+    return result
+  })
+
+  // History: open a saved room, go back to the list, or close it for the live room.
+  on('ui.press', { plugin: 'claude-coop', element: /^hist-/ }, async ($, e) => {
+    if (e.element === 'hist-close') await update($, history, () => null)
+    else if (e.element === 'hist-back') {
+      const rooms = await listHistory($)
+      await update($, history, () => ({ mode: 'list' as const, rooms }))
+    } else {
+      const dir = await historyDir($)
+      const saved = dir && (await readSaved($, `${dir}/${e.element.slice('hist-'.length)}`))
+      if (saved) await update($, history, () => ({ mode: 'room' as const, room: saved.room, me: saved.me, events: saved.events }))
+    }
+
+    return { element: e.element }
+  })
+
+  // 📝 on a message opens a note field under it (again closes it); Enter shares the note with the room.
+  on('ui.press', { plugin: 'claude-coop', element: /^note-btn-\d+$/ }, async ($, e) => {
+    const seq = Number(e.element.slice('note-btn-'.length))
+    await update($, noteFor, current => (current === seq ? null : seq))
+
+    return { element: e.element }
+  })
+
+  on('ui.input', { plugin: 'claude-coop', element: /^note-\d+$/ }, async ($, e) => {
+    if (e.kind === 'submit' && e.value.trim()) {
+      await update($, noteFor, () => null)
+      await post($, 'note', e.value.trim(), [], Number(e.element.slice('note-'.length)))
+    }
+
+    return { element: e.element, value: e.value }
+  })
+
   on('ui.press', { plugin: 'claude-coop', element: 'clear-shots' }, async ($, e) => {
     await update($, shots, () => [])
 
@@ -795,21 +915,16 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
-    const cfg = await read($, config)
-    if (!cfg) {
-      const starting = await read($, invite)
-
-      return <Text dimColor>{starting ?? `Not in a room. ${USAGE}`}</Text>
-    }
-    const list = await read($, events)
-    const who = await read($, typing)
-    const pics = await read($, pictures)
-    // A new key per send draws a fresh, empty field; the same key keeps what was typed.
-    const field = `ask-${await read($, sent)}`
     // Mobile draws no Input; there the main prompt box still works.
     const { Input } = e.surface === 'mobile' ? { Input: undefined } : $.ui.resolve(e)
     // The terminal draws no Svg; there the 📎 line in the text stands in.
     const { Svg } = e.surface === 'terminal' ? { Svg: undefined } : $.ui.resolve(e)
+    const bubble = Math.max(20, Math.floor(e.props.bodyColumns * 0.8))
+    const pics = await read($, pictures)
+    const writingOn = await read($, noteFor)
+    const figures = await read($, usage)
+    const usageBar = figures && <Text dimColor>📊 {usageLine(figures)}</Text>
+
     const previews = (images: readonly (string | undefined)[], width: number) =>
       Svg && (
         <Box flexDirection="row" flexWrap="wrap" gap={1}>
@@ -824,7 +939,104 @@ export const register: Register = on => {
           ))}
         </Box>
       )
-    const bubble = Math.max(20, Math.floor(e.props.bodyColumns * 0.8))
+
+    // The room's messages as bubbles, each with its notes; a live room also offers 📝 to add one.
+    const bubbles = (list: readonly CoopEvent[], me: string, isLive: boolean) => {
+      const notes = list.filter(m => m.kind === 'note')
+
+      return list
+        .filter(m => m.kind !== 'note')
+        .slice(-30)
+        .map(m => {
+          const isMine = m.from === me
+          const owner = isMine ? 'You' : m.from
+          const label = m.kind === 'prompt' ? owner : isMine ? 'Your Claude' : `${m.from}'s Claude`
+
+          return (
+            <Box
+              key={`m${m.seq}`}
+              flexDirection="column"
+              alignSelf={isMine ? 'flex-start' : 'flex-end'}
+              width={bubble}
+              borderStyle="round"
+              borderColor={isMine ? 'green' : 'blue'}
+              paddingX={1}
+            >
+              <Box flexDirection="row" alignItems="center" gap={1}>
+                {Svg && (
+                  <Svg alt="avatar" width={18} height={18} isInteractive source={m.kind === 'prompt' ? avatarSvg(m.from, pics[m.from]) : CLAUDE_AVATAR} />
+                )}
+                <Text bold color={isMine ? 'green' : 'blue'}>
+                  {label}
+                </Text>
+                <Text dimColor>#{m.seq}</Text>
+                {isLive && <Button key={`note-btn-${m.seq}`} plain label="📝" onPress={() => {}} />}
+              </Box>
+              <Text>{m.text.length > 1500 ? `${m.text.slice(0, 1500)}…` : m.text}</Text>
+              {m.images?.length ? previews(m.images, 240) : null}
+              {notes
+                .filter(n => n.ref === m.seq)
+                .map(n => (
+                  <Text color="yellow">
+                    📝 {n.from === me ? 'You' : n.from}: {n.text}
+                  </Text>
+                ))}
+              {isLive && writingOn === m.seq && Input && (
+                <Input key={`note-${m.seq}`} value="" placeholder="Add a note for the room…" submitLabel="add note" autoFocus onSubmit={() => {}} />
+              )}
+            </Box>
+          )
+        })
+    }
+
+    // /coop history: saved rooms to pick from, or one read back.
+    const hist = await read($, history)
+    if (hist) {
+      return (
+        <Box flexDirection="column" gap={1}>
+          {usageBar}
+          <Box flexDirection="row" gap={1}>
+            {hist.mode === 'room' && <Button key="hist-back" label="← All rooms" onPress={() => {}} />}
+            <Button key="hist-close" label="Back to the live room" onPress={() => {}} />
+          </Box>
+          {hist.mode === 'list' ? (
+            hist.rooms.length === 0 ? (
+              <Text dimColor>No saved rooms yet. Rooms are saved as you use them.</Text>
+            ) : (
+              hist.rooms.map(r => (
+                <Button
+                  key={`hist-${r.file}`}
+                  plain
+                  label={`${r.room}  ·  ${r.count} messages  ·  ${new Date(r.savedAt).toLocaleString()}`}
+                  onPress={() => {}}
+                />
+              ))
+            )
+          ) : (
+            <>
+              <Text bold>{hist.room} (saved, read-only)</Text>
+              {bubbles(hist.events, hist.me, false)}
+            </>
+          )}
+        </Box>
+      )
+    }
+
+    const cfg = await read($, config)
+    if (!cfg) {
+      const starting = await read($, invite)
+
+      return (
+        <Box flexDirection="column" gap={1}>
+          {usageBar}
+          <Text dimColor>{starting ?? `Not in a room. ${USAGE}`}</Text>
+        </Box>
+      )
+    }
+    const list = await read($, events)
+    const who = await read($, typing)
+    // A new key per send draws a fresh, empty field; the same key keeps what was typed.
+    const field = `ask-${await read($, sent)}`
     const attached = await read($, shots)
     // Centred and as wide as a bubble, like Claude's own prompt box.
     const box =
@@ -848,6 +1060,7 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column" gap={1}>
+        {usageBar}
         {hosting && (
           <Box flexDirection="column" borderStyle="round" borderColor="magenta" paddingX={1}>
             {hosting.startsWith('/coop join') ? (
@@ -870,34 +1083,7 @@ export const register: Register = on => {
           <Text color="yellow">🔒 {holder === cfg.name ? 'Your' : `${holder}'s`} Claude is editing the shared files</Text>
         )}
         {list.length === 0 && <Text dimColor>Room is empty. Send a prompt to start.</Text>}
-        {list.slice(-30).map(m => {
-          const isMine = m.from === cfg.name
-          const owner = isMine ? 'You' : m.from
-          const label = m.kind === 'prompt' ? owner : isMine ? 'Your Claude' : `${m.from}'s Claude`
-
-          return (
-            <Box
-              key={`m${m.seq}`}
-              flexDirection="column"
-              alignSelf={isMine ? 'flex-start' : 'flex-end'}
-              width={bubble}
-              borderStyle="round"
-              borderColor={isMine ? 'green' : 'blue'}
-              paddingX={1}
-            >
-              <Box flexDirection="row" alignItems="center" gap={1}>
-                {Svg && (
-                  <Svg alt="avatar" width={18} height={18} isInteractive source={m.kind === 'prompt' ? avatarSvg(m.from, pics[m.from]) : CLAUDE_AVATAR} />
-                )}
-                <Text bold color={isMine ? 'green' : 'blue'}>
-                  {label}
-                </Text>
-              </Box>
-              <Text>{m.text.length > 1500 ? `${m.text.slice(0, 1500)}…` : m.text}</Text>
-              {m.images?.length ? previews(m.images, 240) : null}
-            </Box>
-          )
-        })}
+        {bubbles(list, cfg.name, true)}
         {who.length > 0 &&
           (Svg ? (
             <Box flexDirection="row" alignItems="center" gap={1}>

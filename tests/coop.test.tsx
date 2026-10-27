@@ -327,3 +327,62 @@ test('your GitHub picture goes to the room sealed, and peers show with theirs', 
   expect(drawn).toContain('fill=\\"#1f6feb\\"')
   await pane.unmount()
 })
+
+test('notes on messages, saved history to read back, and the usage bar', async ($, on) => {
+  const clock = mock.clock(on)
+  mock.store(on)
+  mock.env(on, { USERPROFILE: 'C:/Users/t', OS: 'Windows_NT' })
+  const keys = await roomKeys('room', 's')
+  const files = new Map<string, string>()
+  const posts: { kind: string; text: string }[] = []
+  // The relay: Jason's prompt, then whatever notes were posted.
+  const relayEvents: { seq: number; from: string; kind: string; text: string; at: number }[] = [
+    { seq: 1, from: 'Jason', kind: 'prompt', text: await seal(keys, JSON.stringify({ text: 'fix the login bug', images: [] })), at: 1 },
+  ]
+  on('command.register', () => ({ value: { command: 'coop' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('ui.status', () => ({ value: undefined }))
+  on('fs.write', (_, e) => (files.set(e.path, e.text), { value: undefined }))
+  on('fs.list', () => ({ value: [...files.keys()].map(path => ({ name: path.split(/[\\/]/).pop() ?? '', kind: 'file' as const, size: 1, mtimeMs: 1, isLink: false })) }))
+  on('fs.read', (_, e) => ({ value: files.get(e.path) ?? '' }))
+  on('session.usage', () => ({
+    value: { startedAt: 0, context: { tokens: 84_000, window: 200_000, percent: 42 }, rateLimits: [{ kind: 'five_hour', percentUsed: 23 }], cost: { usd: 1.5 } },
+  }))
+  on('http.fetch', (_, e) => {
+    if (e.init?.method === 'POST') {
+      const body = JSON.parse(e.init.body ?? '{}') as { from: string; kind: string; text: string }
+      posts.push(body)
+      if (body.kind === 'note') relayEvents.push({ seq: relayEvents.length + 1, from: 'Euan', kind: 'note', text: body.text, at: 2 })
+      return { value: { status: 200, ok: true, headers: {}, text: '{}' } }
+    }
+    const since = Number(new URL(e.url).searchParams.get('since'))
+    return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ events: relayEvents.slice(since), typing: [], total: relayEvents.length }) } }
+  })
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.command.run({ command: 'coop', args: 'join http://relay room s Euan', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 120 } })
+  await clock.advance(1100)
+
+  const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await pane.find({ type: 'Text', text: /Context/ }))?.text).toBe('📊 Context 42% (84k / 200k)  ·  5-hour limit 23%  ·  $1.50 this session')
+
+  // A note on Jason's message goes to the room sealed, pointing at message 1.
+  await pane.press({ key: 'note-btn-1' })
+  await pane.input({ key: 'note-1', text: 'this broke on Safari too' })
+  const note = posts.find(p => p.kind === 'note')
+  expect(JSON.parse((await open(keys, note?.text ?? '')) ?? '{}')).toEqual({ text: 'this broke on Safari too', images: [], ref: 1 })
+  await clock.advance(1100)
+  expect(await pane.find({ type: 'Text', text: /📝 You: this broke on Safari too/ })).toBeDefined()
+
+  // The room was saved as it went, and reads back from /coop history.
+  expect([...files.keys()].map(f => f.replaceAll('\\', '/'))).toEqual(['C:/Users/t/.claude/coop-history/room.json'])
+  await $.command.run({ command: 'coop', args: 'history', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 120 } })
+  await pane.press({ key: 'hist-room.json' })
+  expect(await pane.find({ type: 'Text', text: /saved, read-only/ })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: 'fix the login bug' })).toBeDefined()
+  expect(await pane.find({ key: 'note-btn-1' })).toBeUndefined()
+  await pane.press({ key: 'hist-close' })
+  expect(await pane.find({ key: 'note-btn-1' })).toBeDefined()
+  await pane.unmount()
+})

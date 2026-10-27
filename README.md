@@ -61,6 +61,9 @@ The first person to join a room creates it; everyone else uses the same room nam
 
 Messages, screenshot previews and the room's repo URL are encrypted with a key made from the room name and secret before they leave your PC. The relay, and any tunnel in front of it, sees only ciphertext, plus names, who is typing and who holds the edit lock. It never receives the secret itself. A weak secret can be guessed offline, so use a long random one (`/coop host` makes one for you).
 
+- `/coop history` lists the rooms you've been in and reads any back. Each room is saved as you go to `~/.claude/coop-history/<room>.json`, as plain text on your own PC.
+- Press 📝 on any message to add a note to it. Notes are shared with the room (encrypted) and saved in history.
+- The top of the pane shows your context use, your plan's 5-hour and weekly limits, and what the session has cost.
 - `/coop` opens the pane again.
 - `/coop leave` leaves the room (and stops hosting).
 
