@@ -1,6 +1,6 @@
 {
   "name": "claude-coop",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Share a live Claude chat with friends: everyone prompts on their own account, everyone sees every turn.",
   "types": "./types/index.d.ts"
 }

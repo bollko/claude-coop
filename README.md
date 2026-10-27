@@ -83,5 +83,5 @@ or later, `/coop repo <repo-url>` (`/coop repo none` clears it). Everyone else p
 ## Limits
 
 - The pane polls the relay once a second.
-- Everyone in a room needs this version (0.3.0) or later: older versions don't encrypt.
+- Everyone in a room needs this version (0.3.0) or later: older versions don't encrypt. Screenshot previews and avatars are drawn from small pixel grids.
 - On mobile the pane has no message box; use the main prompt box.

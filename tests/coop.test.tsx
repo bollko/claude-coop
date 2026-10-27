@@ -136,7 +136,7 @@ test('screenshots and picked files go to your Claude as paths, and the room hear
   on('process.run', (_, e) => ({
     value: {
       exitCode: 0,
-      stdout: e.argv.join(' ').includes('OpenFileDialog') ? picked.join('\r\n') : `${shot}\r\n/9j/4AAQ\r\n`,
+      stdout: e.argv.join(' ').includes('OpenFileDialog') ? picked.join('\r\n') : `${shot}\r\npxg:3:1:f00f000f0\r\n`,
       stderr: '',
       isStdoutTruncated: false,
       isStderrTruncated: false,
@@ -157,8 +157,10 @@ test('screenshots and picked files go to your Claude as paths, and the room hear
   const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await pane.press({ key: 'paste' })
   expect(await pane.find({ type: 'Button', text: /screenshot ✕/ })).toBeDefined()
-  // The preview shows in the composer before sending.
-  expect(await pane.find({ type: 'Svg' })).toBeDefined()
+  // The preview shows in the composer before sending, drawn from squares: two red pixels merge into one run.
+  const preview = JSON.stringify(await pane.find({ type: 'Svg' }))
+  expect(preview).toContain('width=\\"2.05\\" height=\\"1.05\\" fill=\\"#f00\\"')
+  expect(preview).not.toContain('<image')
   await pane.input({ key: 'ask-0', text: 'what is wrong here?' })
   // A fresh field replaces the one that was sent from, so the text clears.
   expect(await pane.find({ key: 'ask-0' })).toBeUndefined()
@@ -168,7 +170,7 @@ test('screenshots and picked files go to your Claude as paths, and the room hear
   await $.turn.start({ text: submitted, turnId: 't1' })
   const prompts = posts.map(p => JSON.parse(p) as { kind: string; text: string; images?: string[] }).filter(p => p.kind === 'prompt')
   expect(prompts.map(p => p.text)).toEqual(['what is wrong here?\n📎 screenshot'])
-  expect(prompts[0]?.images).toEqual(['data:image/jpeg;base64,/9j/4AAQ'])
+  expect(prompts[0]?.images).toEqual(['pxg:3:1:f00f000f0'])
   // Sent once: the next message carries none.
   expect(await pane.find({ type: 'Button', text: /✕/ })).toBeUndefined()
 

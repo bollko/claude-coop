@@ -25,19 +25,22 @@ const invite = atom({ plugin: 'claude-coop', key: 'invite' } as const, null)
 const shots = atom({ plugin: 'claude-coop', key: 'shots' } as const, [])
 
 // A pane field takes no pasted images, so the button reads the clipboard through the OS.
-// Each grab prints the full PNG's path, then a small JPEG preview as base64.
+// Each grab prints the full PNG's path, then a preview: the image shrunk to fit 48x36 pixels,
+// each pixel 3 hex digits (4 bits a channel), as `pxg:<w>:<h>:<pixels>`.
 const PS_GRAB =
   'Add-Type -AssemblyName System.Windows.Forms,System.Drawing; $i = [Windows.Forms.Clipboard]::GetImage(); if (-not $i) { exit 3 }; ' +
   "$p = Join-Path $env:TEMP ('coop-shot-' + [guid]::NewGuid() + '.png'); $i.Save($p, [Drawing.Imaging.ImageFormat]::Png); $p; " +
-  '$w = [Math]::Min(480, $i.Width); $t = New-Object Drawing.Bitmap $i, $w, ([int]($i.Height * $w / $i.Width)); ' +
-  '$m = New-Object IO.MemoryStream; $t.Save($m, [Drawing.Imaging.ImageFormat]::Jpeg); [Convert]::ToBase64String($m.ToArray())'
-// macOS (pngpaste or AppleScript, sips for the preview), then Linux (wl-paste or xclip, no preview); $0 is the file to write.
+  '$k = [Math]::Min([Math]::Min(48 / $i.Width, 36 / $i.Height), 1); $w = [Math]::Max(1, [int]($i.Width * $k)); $h = [Math]::Max(1, [int]($i.Height * $k)); ' +
+  "$t = New-Object Drawing.Bitmap $w, $h; $g = [Drawing.Graphics]::FromImage($t); $g.InterpolationMode = 'HighQualityBicubic'; $g.DrawImage($i, 0, 0, $w, $h); " +
+  '$b = New-Object Text.StringBuilder; [void]$b.Append("pxg:${w}:${h}:"); ' +
+  'for ($y = 0; $y -lt $h; $y++) { for ($x = 0; $x -lt $w; $x++) { $c = $t.GetPixel($x, $y); ' +
+  "[void]$b.AppendFormat('{0:x}{1:x}{2:x}', [int][Math]::Floor($c.R / 16), [int][Math]::Floor($c.G / 16), [int][Math]::Floor($c.B / 16)) } }; $b.ToString()"
+// macOS (pngpaste or AppleScript), then Linux (wl-paste or xclip); no preview there yet. $0 is the file to write.
 const SH_GRAB =
   '(command -v pngpaste >/dev/null && pngpaste "$0") || ' +
   "osascript -e 'on run a' -e 'set f to open for access (POSIX file (item 1 of a)) with write permission' -e 'write (the clipboard as «class PNGf») to f' -e 'close access f' -e 'end run' \"$0\" 2>/dev/null || " +
   '(command -v wl-paste >/dev/null && wl-paste --type image/png > "$0") || ' +
-  'xclip -selection clipboard -t image/png -o > "$0" 2>/dev/null; [ -s "$0" ] || exit 3; echo "$0"; ' +
-  'command -v sips >/dev/null && sips -s format jpeg -Z 480 "$0" --out "$0.jpg" >/dev/null && base64 < "$0.jpg" | tr -d "\\n"'
+  'xclip -selection clipboard -t image/png -o > "$0" 2>/dev/null; [ -s "$0" ] || exit 3; echo "$0"'
 
 // The OS file picker, several files at once; prints one path per line, nothing on cancel.
 const PS_PICK =
@@ -72,10 +75,9 @@ const grabScreenshot = async ($: EngineInterface): Promise<Attachment | undefine
     : ['sh', '-c', SH_GRAB, `/tmp/coop-shot-${Date.now()}.png`]
   const res = await $.process.run(argv, { timeoutMs: 15000 }).catch(() => undefined)
   if (res?.exitCode !== 0) return undefined
-  const [path, base64] = res.stdout.trim().split(/\r?\n/)
+  const [path, grid] = res.stdout.trim().split(/\r?\n/)
   if (!path) return undefined
-  // ponytail: previews over ~90 KB are dropped to fit an Svg's 131072-character source.
-  const preview = base64 && base64.length < 90_000 ? `data:image/jpeg;base64,${base64.trim()}` : undefined
+  const preview = isPreview(grid?.trim()) ? grid?.trim() : undefined
 
   return { path, name: 'screenshot', preview }
 }
@@ -92,9 +94,16 @@ export const withShots = (text: string, paths: readonly string[]) =>
     ? `${text}\n\nAttached (open each with the Read tool):\n${paths.map(p => `- ${p}`).join('\n')}`.trim()
     : text
 
-// Peers' previews arrive from the relay: only a plain base64 JPEG goes into the SVG markup.
-const isPreview = (src: string | undefined): src is string =>
-  !!src && src.length < 120_000 && /^data:image\/jpeg;base64,[A-Za-z0-9+/=]+$/.test(src)
+// A preview: `pxg:<w>:<h>:` then w*h pixels of 3 hex digits. Peers' arrive from the relay, so only this exact form is drawn.
+export const parsePreview = (src: string | undefined) => {
+  const m = src?.match(/^pxg:(\d{1,2}):(\d{1,2}):([0-9a-f]+)$/)
+  const w = Number(m?.[1])
+  const h = Number(m?.[2])
+  if (!m || w < 1 || h < 1 || w > 48 || h > 36 || m[3]!.length !== w * h * 3) return undefined
+
+  return { w, h, px: m[3]! }
+}
+const isPreview = (src: string | undefined): src is string => parsePreview(src) !== undefined
 
 // A picture is a 16x16 grid of RRGGBB pixels: the desktop's Svg drops embedded images,
 // so avatars are drawn from plain squares. Peers' grids go into markup only in this exact form.
@@ -128,18 +137,6 @@ export const avatarSvg = (name: string, picture?: string) => {
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><circle cx="12" cy="12" r="12" fill="${fill}"/><text x="12" y="16.5" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="600" fill="#ffffff">${initial}</text></svg>`
 }
 
-// ponytail: temporary probe for what the desktop's Svg scrub keeps; delete once the answers are in.
-const PNG_DOT = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=='
-const SVG_PROBES: [string, string][] = [
-  ['A hex', '<circle cx="12" cy="12" r="12" fill="#3a8fd9"/>'],
-  ['B hsl', '<circle cx="12" cy="12" r="12" fill="hsl(120,55%,45%)"/>'],
-  ['C text', '<rect width="24" height="24" fill="#555555"/><text x="12" y="17" text-anchor="middle" font-size="14" fill="#ffffff">E</text>'],
-  ['D image', `<image href="data:image/png;base64,${PNG_DOT}" width="24" height="24"/>`],
-  ['E clip', '<defs><clipPath id="c"><circle cx="12" cy="12" r="12"/></clipPath></defs><rect width="24" height="24" fill="#d97757" clip-path="url(#c)"/>'],
-  ['F rects', '<rect width="12" height="12" fill="#ff0000"/><rect x="12" y="12" width="12" height="12" fill="#00ff00"/>'],
-]
-const probe = atom({ plugin: 'claude-coop', key: 'probe' } as const, false)
-
 // Claude's own mark, for the bubbles of Claude's answers.
 const CLAUDE_AVATAR =
   '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><circle cx="12" cy="12" r="12" fill="#d97757"/><text x="12" y="17" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#fff">✳</text></svg>'
@@ -155,9 +152,24 @@ const TYPING_DOTS =
     .join('') +
   '</svg>'
 
-// A preview as an SVG image, letterboxed into a fixed 480x300 box.
-const previewSvg = (src: string) =>
-  `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 300"><image href="${src}" width="480" height="300" preserveAspectRatio="xMidYMid meet"/></svg>`
+// A preview drawn from plain squares (the desktop's Svg drops embedded images): one per run of
+// same-coloured pixels in a row, so a 48x36 grid stays far under an Svg's 131072-character source.
+export const previewSvg = (src: string) => {
+  const grid = parsePreview(src)
+  if (!grid) return ''
+  const at = (x: number, y: number) => grid.px.slice((y * grid.w + x) * 3, (y * grid.w + x) * 3 + 3)
+  let rects = ''
+  for (let y = 0; y < grid.h; y++) {
+    for (let x = 0; x < grid.w; ) {
+      let run = 1
+      while (x + run < grid.w && at(x + run, y) === at(x, y)) run++
+      rects += `<rect x="${x}" y="${y}" width="${run + 0.05}" height="1.05" fill="#${at(x, y)}"/>`
+      x += run
+    }
+  }
+
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${grid.w} ${grid.h}" shape-rendering="crispEdges">${rects}</svg>`
+}
 
 const roomUrl = (cfg: CoopConfig) => `${cfg.server.replace(/\/+$/, '')}/rooms/${encodeURIComponent(cfg.room)}`
 
@@ -665,13 +677,6 @@ export const register: Register = on => {
     }
     const cfg = await read($, config)
     if (!cfg) return { text: `Not in a room. ${USAGE}` }
-    if (verb === 'svgtest') {
-      const shown = !(await read($, probe))
-      await update($, probe, () => shown)
-      await $.ui.open({ id: PANE, title: 'Co-op' })
-
-      return { text: shown ? 'Drawing test shown at the top of the Co-op pane: which of A–F appear?' : 'Drawing test hidden.' }
-    }
     if (verb === 'avatar') {
       // `/coop avatar <github-username>` uses that account's picture; `none` goes back to initials.
       const user = server
@@ -809,7 +814,13 @@ export const register: Register = on => {
       Svg && (
         <Box flexDirection="row" flexWrap="wrap" gap={1}>
           {images.filter(isPreview).map(src => (
-            <Svg alt="screenshot" width={width} height={Math.round((width * 300) / 480)} isInteractive source={previewSvg(src)} />
+            <Svg
+              alt="screenshot"
+              width={width}
+              height={Math.round((width * (parsePreview(src)?.h ?? 3)) / (parsePreview(src)?.w ?? 4))}
+              isInteractive
+              source={previewSvg(src)}
+            />
           ))}
         </Box>
       )
@@ -837,16 +848,6 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column" gap={1}>
-        {Svg && (await read($, probe)) && (
-          <Box flexDirection="row" gap={2} flexWrap="wrap">
-            {SVG_PROBES.map(([label, body]) => (
-              <Box flexDirection="column" alignItems="center">
-                <Svg alt={label} width={32} height={32} isInteractive source={`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">${body}</svg>`} />
-                <Text dimColor>{label}</Text>
-              </Box>
-            ))}
-          </Box>
-        )}
         {hosting && (
           <Box flexDirection="column" borderStyle="round" borderColor="magenta" paddingX={1}>
             {hosting.startsWith('/coop join') ? (
