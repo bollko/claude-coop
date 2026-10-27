@@ -212,17 +212,14 @@ export const register: Register = on => {
     await read($, sent)
     // Mobile draws no Input; there the main prompt box still works.
     const { Input } = e.surface === 'mobile' ? { Input: undefined } : $.ui.resolve(e)
+    const bubble = Math.max(20, Math.floor(e.props.bodyColumns * 0.8))
+    // Centred and as wide as a bubble, like Claude's own prompt box.
     const box =
       Input && (
-        <Input
-          key="ask"
-          value=""
-          placeholder="Message your Claude…"
-          submitLabel="send"
-          onSubmit={() => {}}
-        />
+        <Box flexDirection="column" alignSelf="center" width={bubble} borderStyle="round" borderDimColor paddingX={1}>
+          <Input key="ask" value="" rows={3} placeholder="Message your Claude…" submitLabel="send" onSubmit={() => {}} />
+        </Box>
       )
-    const bubble = Math.max(20, Math.floor(e.props.bodyColumns * 0.8))
 
     return (
       <Box flexDirection="column" gap={1}>
