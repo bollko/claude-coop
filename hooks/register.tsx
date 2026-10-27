@@ -7,7 +7,7 @@ import type { RoomKeys } from './crypto'
 
 const PANE = 'coop'
 const USAGE =
-  '/coop host <your-name> [repo-url]  |  /coop join <server-url> <room> <secret> <your-name> [repo-url]  |  /coop repo <url|none>  |  /coop ship  |  /coop leave  |  /coop'
+  '/coop host <your-name> [repo-url]  |  /coop avatar <github-username|none>  |  /coop join <server-url> <room> <secret> <your-name> [repo-url]  |  /coop repo <url|none>  |  /coop ship  |  /coop leave  |  /coop'
 const config = atom({ plugin: 'claude-coop', key: 'config' } as const, null)
 const events = atom({ plugin: 'claude-coop', key: 'events' } as const, [])
 const typing = atom({ plugin: 'claude-coop', key: 'typing' } as const, [])
@@ -17,6 +17,8 @@ const sent = atom({ plugin: 'claude-coop', key: 'sent' } as const, 0)
 // The room's repo as this folder stands with it, and who holds the edit lock.
 const workspace = atom({ plugin: 'claude-coop', key: 'workspace' } as const, null)
 const lock = atom({ plugin: 'claude-coop', key: 'lock' } as const, null)
+// Everyone's picture by name, opened from the relay's sealed copies.
+const pictures = atom({ plugin: 'claude-coop', key: 'pictures' } as const, {})
 // While hosting: the join line to hand friends, or what hosting is doing now.
 const invite = atom({ plugin: 'claude-coop', key: 'invite' } as const, null)
 // Screenshots and files waiting to go with the next pane message.
@@ -94,9 +96,15 @@ export const withShots = (text: string, paths: readonly string[]) =>
 const isPreview = (src: string | undefined): src is string =>
   !!src && src.length < 120_000 && /^data:image\/jpeg;base64,[A-Za-z0-9+/=]+$/.test(src)
 
-// A person's avatar: their initial on a colour picked from their name, the same on every screen.
-// ponytail: generated only; add uploaded pictures (sent once per person, encrypted) if people want them.
-export const avatarSvg = (name: string) => {
+// Pictures arrive from peers: only a plain base64 PNG or JPEG goes into the SVG markup.
+export const isPicture = (src: unknown): src is string =>
+  typeof src === 'string' && src.length < 45_000 && /^data:image\/(png|jpeg);base64,[A-Za-z0-9+/=]+$/.test(src)
+
+// A person's avatar: their picture in a circle, else their initial on a colour picked from their name.
+export const avatarSvg = (name: string, picture?: string) => {
+  if (isPicture(picture)) {
+    return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><defs><clipPath id="c"><circle cx="12" cy="12" r="12"/></clipPath></defs><image href="${picture}" width="24" height="24" clip-path="url(#c)" preserveAspectRatio="xMidYMid slice"/></svg>`
+  }
   const hue = [...name].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 360, 7)
   const initial = (name.trim()[0] ?? '?').toUpperCase().replace(/[<>&"']/, '?')
 
@@ -124,7 +132,7 @@ const previewSvg = (src: string) =>
 
 const roomUrl = (cfg: CoopConfig) => `${cfg.server.replace(/\/+$/, '')}/rooms/${encodeURIComponent(cfg.room)}`
 
-type PostKind = 'prompt' | 'answer' | 'typing' | 'repo' | 'lock' | 'unlock'
+type PostKind = 'prompt' | 'answer' | 'typing' | 'repo' | 'lock' | 'unlock' | 'profile'
 
 let cachedKeys: { id: string; keys: Promise<RoomKeys> } | undefined
 const keysFor = (cfg: CoopConfig) => {
@@ -142,7 +150,7 @@ const post = async ($: EngineInterface, kind: PostKind, text = '', images: strin
   const body =
     kind === 'prompt' || kind === 'answer'
       ? { from: cfg.name, kind, text: await seal(keys, JSON.stringify({ text, images })) }
-      : { from: cfg.name, kind, text: kind === 'repo' && text ? await seal(keys, text) : text }
+      : { from: cfg.name, kind, text: (kind === 'repo' || kind === 'profile') && text ? await seal(keys, text) : text }
   try {
     return await $.http.fetch(roomUrl(cfg), {
       method: 'POST',
@@ -153,6 +161,56 @@ const post = async ($: EngineInterface, kind: PostKind, text = '', images: strin
     $.ui.status('coop: relay unreachable')
     return undefined
   }
+}
+
+// --- Your picture: your GitHub avatar, fetched once and kept across sessions in $.store('picture').
+
+// `gh` signed in gives your avatar's URL; a username given to /coop avatar gives it too.
+const githubAvatarUrl = async ($: EngineInterface, user?: string) => {
+  if (user) return `https://github.com/${user}.png?size=64`
+  const res = await $.process.run(['gh', 'api', 'user', '--jq', '.avatar_url'], { timeoutMs: 15_000 }).catch(() => undefined)
+  const url = res?.exitCode === 0 ? res.stdout.trim() : ''
+
+  return url.startsWith('https://') ? `${url}${url.includes('?') ? '&' : '?'}s=64` : undefined
+}
+
+// $.http.fetch reads bodies as text, so the bytes come down through the OS, as base64.
+const downloadPicture = async ($: EngineInterface, url: string) => {
+  const isWindows = (await $.env.get('OS')) === 'Windows_NT'
+  const argv = isWindows
+    ? ['powershell', '-NoProfile', '-Command', '[Convert]::ToBase64String((Invoke-WebRequest -UseBasicParsing -Uri $env:COOP_URL).Content)']
+    : ['sh', '-c', 'curl -fsSL "$COOP_URL" | base64 | tr -d "\\n"']
+  const res = await $.process.run(argv, { env: { COOP_URL: url }, timeoutMs: 20_000 }).catch(() => undefined)
+  const b64 = res?.exitCode === 0 ? res.stdout.trim() : ''
+  const type = b64.startsWith('iVBOR') ? 'png' : b64.startsWith('/9j/') ? 'jpeg' : undefined
+  const picture = type && `data:image/${type};base64,${b64}`
+
+  return isPicture(picture) ? picture : undefined
+}
+
+const fetchPicture = async ($: EngineInterface, user?: string) => {
+  const url = await githubAvatarUrl($, user)
+  const picture = url && (await downloadPicture($, url))
+  if (picture) await $.store.set('picture', picture)
+
+  return picture
+}
+
+// Tells the room your picture (or that you have none); the relay forgets on restart, so poll resends.
+let lastProfilePost = 0
+const shareProfile = async ($: EngineInterface) => {
+  lastProfilePost = Date.now()
+  const picture = (await $.store.get('picture')) as string | undefined
+  await post($, 'profile', isPicture(picture) ? picture : '')
+}
+
+// First time in a room with no picture kept: try gh quietly, then share whatever there is.
+const setupProfile = async ($: EngineInterface) => {
+  if (!(await $.store.get('picture')) && !(await $.store.get('pictureTried'))) {
+    await $.store.set('pictureTried', true)
+    await fetchPicture($)
+  }
+  await shareProfile($)
 }
 
 // --- Hosting: this PC runs the relay, and a free localhost.run tunnel (over the ssh the OS ships) makes it public.
@@ -221,6 +279,7 @@ const startHosting = async ($: EngineInterface, name: string, repo?: string) => 
   await update($, fed, () => 0)
   await update($, workspace, () => null)
   if (repo) await post($, 'repo', repo)
+  void setupProfile($)
 
   await update($, invite, () => 'Opening a public tunnel through localhost.run…')
   const tunnel = $.process
@@ -367,6 +426,21 @@ const markTyping = ($: EngineInterface) => {
   void post($, 'typing')
 }
 
+// Opens the room's pictures when the relay's set changes; resends ours when the relay lacks it.
+let lastProfiles = ''
+const syncPictures = async ($: EngineInterface, keys: RoomKeys, profiles: Record<string, string>, me: string) => {
+  if (!(me in profiles) && Date.now() - lastProfilePost > 30_000) void shareProfile($)
+  const raw = JSON.stringify(profiles)
+  if (raw === lastProfiles) return
+  lastProfiles = raw
+  const opened: Record<string, string> = {}
+  for (const [name, sealed] of Object.entries(profiles)) {
+    const picture = await open(keys, sealed)
+    if (isPicture(picture)) opened[name] = picture
+  }
+  await update($, pictures, () => opened)
+}
+
 // A sealed message back to its text and previews; one that won't open says so rather than vanish.
 const openEvent = async (keys: RoomKeys, m: CoopEvent): Promise<CoopEvent> => {
   if (!isSealed(m.text)) return m
@@ -395,7 +469,9 @@ const poll = async ($: EngineInterface) => {
       total?: number
       repo?: string | null
       lock?: string | null
+      profiles?: Record<string, string>
     }
+    await syncPictures($, keys, body.profiles ?? {}, cfg.name)
     const repo = body.repo && isSealed(body.repo) ? ((await open(keys, body.repo)) ?? null) : (body.repo ?? null)
     await syncWorkspace($, repo, cfg.room)
     const holder = body.lock ?? null
@@ -548,12 +624,31 @@ export const register: Register = on => {
       await update($, workspace, () => null)
       // Joining with a repo sets the room's; the next poll puts this folder on its branch.
       if (repo) await post($, 'repo', repo)
+      void setupProfile($)
       await $.ui.open({ id: PANE, title: `Co-op: ${room}` })
 
       return { text: `Joined co-op room ${room} as ${name}.${repo ? ` Shared repo: ${repo}` : ''}` }
     }
     const cfg = await read($, config)
     if (!cfg) return { text: `Not in a room. ${USAGE}` }
+    if (verb === 'avatar') {
+      // `/coop avatar <github-username>` uses that account's picture; `none` goes back to initials.
+      const user = server
+      if (user === 'none') {
+        await $.store.delete('picture')
+        await shareProfile($)
+
+        return { text: 'Avatar cleared: your initial shows instead.' }
+      }
+      if (user && !/^[A-Za-z0-9-]{1,39}$/.test(user)) return { text: 'Usage: /coop avatar <github-username> | none' }
+      const picture = await fetchPicture($, user)
+      if (!picture) {
+        return { text: user ? `Couldn't download ${user}'s GitHub picture.` : 'No GitHub sign-in found (gh). Try /coop avatar <github-username>.' }
+      }
+      await shareProfile($)
+
+      return { text: 'Avatar set: the room now shows your GitHub picture.' }
+    }
     if (verb === 'repo') {
       // `/coop repo <url>` sets the room's shared repo; `/coop repo none` clears it.
       const url = server && server !== 'none' ? server : ''
@@ -662,6 +757,7 @@ export const register: Register = on => {
     }
     const list = await read($, events)
     const who = await read($, typing)
+    const pics = await read($, pictures)
     // A new key per send draws a fresh, empty field; the same key keeps what was typed.
     const field = `ask-${await read($, sent)}`
     // Mobile draws no Input; there the main prompt box still works.
@@ -739,7 +835,7 @@ export const register: Register = on => {
             >
               <Box flexDirection="row" alignItems="center" gap={1}>
                 {Svg && (
-                  <Svg alt="avatar" width={18} height={18} isInteractive source={m.kind === 'prompt' ? avatarSvg(m.from) : CLAUDE_AVATAR} />
+                  <Svg alt="avatar" width={18} height={18} isInteractive source={m.kind === 'prompt' ? avatarSvg(m.from, pics[m.from]) : CLAUDE_AVATAR} />
                 )}
                 <Text bold color={isMine ? 'green' : 'blue'}>
                   {label}
@@ -754,7 +850,7 @@ export const register: Register = on => {
           (Svg ? (
             <Box flexDirection="row" alignItems="center" gap={1}>
               {who.map(name => (
-                <Svg alt={name} width={18} height={18} isInteractive source={avatarSvg(name)} />
+                <Svg alt={name} width={18} height={18} isInteractive source={avatarSvg(name, pics[name])} />
               ))}
               <Text dimColor italic>
                 {who.join(', ')} {who.length > 1 ? 'are' : 'is'} typing

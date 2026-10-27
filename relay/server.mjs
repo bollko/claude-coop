@@ -5,7 +5,7 @@ import { createServer } from 'node:http'
 const TYPING_MS = 4000
 // A Claude editing the shared files holds the lock; one that vanishes loses it after this.
 const LOCK_MS = 15 * 60_000
-const KINDS = new Set(['prompt', 'answer', 'typing', 'repo', 'lock', 'unlock'])
+const KINDS = new Set(['prompt', 'answer', 'typing', 'repo', 'lock', 'unlock', 'profile'])
 // ponytail: in-memory rooms, lost on restart; add a JSON file or SQLite when rooms must persist.
 const rooms = new Map()
 
@@ -34,7 +34,14 @@ const server = createServer(async (req, res) => {
     const typing = [...room.typing].filter(([, at]) => now - at < TYPING_MS).map(([who]) => who)
     const lock = room.lock && now - room.lock.at < LOCK_MS ? room.lock.holder : null
     // total lets a client notice the relay restarted under it and start over.
-    return send(res, 200, { events: room.events.slice(since), typing, total: room.events.length, repo: room.repo ?? null, lock })
+    return send(res, 200, {
+      events: room.events.slice(since),
+      typing,
+      total: room.events.length,
+      repo: room.repo ?? null,
+      lock,
+      profiles: Object.fromEntries(room.profiles ?? []),
+    })
   }
 
   if (req.method !== 'POST') return send(res, 405, { error: 'GET or POST' })
@@ -73,6 +80,14 @@ const server = createServer(async (req, res) => {
     const held = room.lock && Date.now() - room.lock.at < LOCK_MS && room.lock.holder !== from
     if (held) return send(res, 409, { holder: room.lock.holder })
     room.lock = { holder: from, at: Date.now() }
+    return send(res, 200, {})
+  }
+  // Each person's picture, sealed by their client: kept per name, empty text removes it.
+  if (kind === 'profile') {
+    if (text.length > 60_000) return send(res, 400, { error: 'profile too large' })
+    room.profiles ??= new Map()
+    if (text) room.profiles.set(from, text)
+    else room.profiles.delete(from)
     return send(res, 200, {})
   }
   if (kind === 'unlock') {

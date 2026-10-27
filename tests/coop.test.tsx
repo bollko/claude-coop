@@ -1,13 +1,14 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { isSealed, open, roomKeys } from '../hooks/crypto'
+import { isSealed, open, roomKeys, seal } from '../hooks/crypto'
 
 // What the relay was sent, opened as a room member would; raw keeps what it actually saw.
 const raw: string[] = []
 const opened = async (body: string, room: string, secret: string) => {
   raw.push(body)
   const ev = JSON.parse(body) as { from: string; kind: string; text: string }
-  if (!isSealed(ev.text)) return body
+  // Only chat messages seal a {text, images} payload; other kinds are checked by their own tests.
+  if (!isSealed(ev.text) || (ev.kind !== 'prompt' && ev.kind !== 'answer')) return body
   const plain = JSON.parse((await open(await roomKeys(room, secret), ev.text)) ?? '{}') as { text: string; images: string[] }
 
   return JSON.stringify(plain.images.length ? { ...ev, text: plain.text, images: plain.images } : { ...ev, text: plain.text })
@@ -283,4 +284,42 @@ test('/coop host starts the relay and a tunnel, then offers an invite to copy', 
   expect(copied).toBe(line?.text ?? 'missing')
   await pane.unmount()
   finish()
+})
+
+test('your GitHub picture goes to the room sealed, and peers show with theirs', async ($, on) => {
+  const clock = mock.clock(on)
+  mock.store(on)
+  const keys = await roomKeys('room', 's')
+  const jasonPic = 'data:image/jpeg;base64,/9j/JASON'
+  const profiles = { Jason: await seal(keys, jasonPic) }
+  const posts: string[] = []
+  on('command.register', () => ({ value: { command: 'coop' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('ui.status', () => ({ value: undefined }))
+  on('env.get', () => ({ value: 'Windows_NT' }))
+  on('process.run', (_, e) => {
+    const out = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+    return e.argv[0] === 'gh' ? out('https://avatars.githubusercontent.com/u/1?v=4\n') : out('/9j/EUAN\r\n')
+  })
+  on('http.fetch', async (_, e) => {
+    if (e.init?.method === 'POST') posts.push(await opened(e.init.body ?? '', 'room', 's'))
+    const events = [{ seq: 1, from: 'Jason', kind: 'prompt', text: 'hi', at: 1 }]
+    return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ events, typing: ['Jason'], total: 1, profiles }) } }
+  })
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.command.run({ command: 'coop', args: 'join http://relay room s Euan', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 120 } })
+  await clock.advance(1100)
+
+  // The relay got Euan's picture sealed; opened, it's the GitHub download.
+  const profile = posts.map(p => JSON.parse(p) as { kind: string; text: string }).find(p => p.kind === 'profile')
+  expect(profile).toBeDefined()
+  expect(await open(keys, profile?.text ?? '')).toBe('data:image/jpeg;base64,/9j/EUAN')
+  expect(raw.some(body => body.includes('/9j/EUAN'))).toBe(false)
+
+  const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const drawn = JSON.stringify(await pane.find({ type: 'Svg' }))
+  expect(drawn).toContain('/9j/JASON')
+  await pane.unmount()
 })
