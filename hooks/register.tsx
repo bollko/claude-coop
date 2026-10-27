@@ -96,7 +96,13 @@ const poll = async ($: EngineInterface) => {
     const res = await $.http.fetch(`${roomUrl(cfg)}?since=${since}`, { headers: { 'x-coop-secret': cfg.secret } })
     if (!res.ok) return $.ui.status(`coop: relay said ${res.status}`)
     $.ui.status(`coop: ${cfg.room}`)
-    const body = JSON.parse(res.text) as { events: CoopEvent[]; typing: string[] }
+    const body = JSON.parse(res.text) as { events: CoopEvent[]; typing: string[]; total?: number }
+    // Fewer events than we hold: the relay restarted and the room is new.
+    if (body.total !== undefined && body.total < since) {
+      await update($, events, () => [])
+      await update($, fed, () => 0)
+      return
+    }
     if (body.events.length) await update($, events, list => (list.length === since ? [...list, ...body.events] : list))
     const who = body.typing.filter(name => name !== cfg.name)
     if (who.join() !== (await read($, typing)).join()) await update($, typing, () => who)

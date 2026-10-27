@@ -30,7 +30,8 @@ createServer(async (req, res) => {
     const since = Math.max(0, Number(url.searchParams.get('since')) || 0)
     const now = Date.now()
     const typing = [...room.typing].filter(([, at]) => now - at < TYPING_MS).map(([who]) => who)
-    return send(res, 200, { events: room.events.slice(since), typing })
+    // total lets a client notice the relay restarted under it and start over.
+    return send(res, 200, { events: room.events.slice(since), typing, total: room.events.length })
   }
 
   if (req.method !== 'POST') return send(res, 405, { error: 'GET or POST' })
