@@ -94,6 +94,30 @@ export const withShots = (text: string, paths: readonly string[]) =>
 const isPreview = (src: string | undefined): src is string =>
   !!src && src.length < 120_000 && /^data:image\/jpeg;base64,[A-Za-z0-9+/=]+$/.test(src)
 
+// A person's avatar: their initial on a colour picked from their name, the same on every screen.
+// ponytail: generated only; add uploaded pictures (sent once per person, encrypted) if people want them.
+export const avatarSvg = (name: string) => {
+  const hue = [...name].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 360, 7)
+  const initial = (name.trim()[0] ?? '?').toUpperCase().replace(/[<>&"']/, '?')
+
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><circle cx="12" cy="12" r="12" fill="hsl(${hue},55%,45%)"/><text x="12" y="16.5" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="600" fill="#fff">${initial}</text></svg>`
+}
+
+// Claude's own mark, for the bubbles of Claude's answers.
+const CLAUDE_AVATAR =
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><circle cx="12" cy="12" r="12" fill="#d97757"/><text x="12" y="17" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#fff">✳</text></svg>'
+
+// Three dots that pulse in turn; SMIL animates only in an interactive Svg.
+const TYPING_DOTS =
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 30 10">' +
+  [0, 1, 2]
+    .map(
+      i =>
+        `<circle cx="${5 + i * 10}" cy="5" r="3" fill="#999"><animate attributeName="opacity" values="0.25;1;0.25" dur="1.2s" begin="${i * 0.2}s" repeatCount="indefinite"/></circle>`,
+    )
+    .join('') +
+  '</svg>'
+
 // A preview as an SVG image, letterboxed into a fixed 480x300 box.
 const previewSvg = (src: string) =>
   `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 300"><image href="${src}" width="480" height="300" preserveAspectRatio="xMidYMid meet"/></svg>`
@@ -713,17 +737,35 @@ export const register: Register = on => {
               borderColor={isMine ? 'green' : 'blue'}
               paddingX={1}
             >
-              <Text bold color={isMine ? 'green' : 'blue'}>{label}</Text>
+              <Box flexDirection="row" alignItems="center" gap={1}>
+                {Svg && (
+                  <Svg alt="" width={18} height={18} source={m.kind === 'prompt' ? avatarSvg(m.from) : CLAUDE_AVATAR} />
+                )}
+                <Text bold color={isMine ? 'green' : 'blue'}>
+                  {label}
+                </Text>
+              </Box>
               <Text>{m.text.length > 1500 ? `${m.text.slice(0, 1500)}…` : m.text}</Text>
               {m.images?.length ? previews(m.images, 240) : null}
             </Box>
           )
         })}
-        {who.length > 0 && (
-          <Text dimColor italic>
-            ●●● {who.join(', ')} {who.length > 1 ? 'are' : 'is'} typing...
-          </Text>
-        )}
+        {who.length > 0 &&
+          (Svg ? (
+            <Box flexDirection="row" alignItems="center" gap={1}>
+              {who.map(name => (
+                <Svg alt="" width={18} height={18} source={avatarSvg(name)} />
+              ))}
+              <Text dimColor italic>
+                {who.join(', ')} {who.length > 1 ? 'are' : 'is'} typing
+              </Text>
+              <Svg alt="…" width={24} height={8} isInteractive source={TYPING_DOTS} />
+            </Box>
+          ) : (
+            <Text dimColor italic>
+              ●●● {who.join(', ')} {who.length > 1 ? 'are' : 'is'} typing...
+            </Text>
+          ))}
         {box}
       </Box>
     )
