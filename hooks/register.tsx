@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { CoopConfig, CoopEvent } from '../types'
+import type { CoopConfig, CoopEvent, Shot } from '../types'
 
 const PANE = 'coop'
 const USAGE = '/coop join <server-url> <room> <secret> <your-name>  |  /coop leave  |  /coop'
@@ -15,47 +15,63 @@ const sent = atom({ plugin: 'claude-coop', key: 'sent' } as const, 0)
 const shots = atom({ plugin: 'claude-coop', key: 'shots' } as const, [])
 
 // A pane field takes no pasted images, so the button reads the clipboard through the OS.
+// Each grab prints the full PNG's path, then a small JPEG preview as base64.
 const PS_GRAB =
   'Add-Type -AssemblyName System.Windows.Forms,System.Drawing; $i = [Windows.Forms.Clipboard]::GetImage(); if (-not $i) { exit 3 }; ' +
-  "$p = Join-Path $env:TEMP ('coop-shot-' + [guid]::NewGuid() + '.png'); $i.Save($p, [Drawing.Imaging.ImageFormat]::Png); $p"
-// macOS (pngpaste or AppleScript), then Linux (wl-paste or xclip); $0 is the file to write.
+  "$p = Join-Path $env:TEMP ('coop-shot-' + [guid]::NewGuid() + '.png'); $i.Save($p, [Drawing.Imaging.ImageFormat]::Png); $p; " +
+  '$w = [Math]::Min(480, $i.Width); $t = New-Object Drawing.Bitmap $i, $w, ([int]($i.Height * $w / $i.Width)); ' +
+  '$m = New-Object IO.MemoryStream; $t.Save($m, [Drawing.Imaging.ImageFormat]::Jpeg); [Convert]::ToBase64String($m.ToArray())'
+// macOS (pngpaste or AppleScript, sips for the preview), then Linux (wl-paste or xclip, no preview); $0 is the file to write.
 const SH_GRAB =
   '(command -v pngpaste >/dev/null && pngpaste "$0") || ' +
   "osascript -e 'on run a' -e 'set f to open for access (POSIX file (item 1 of a)) with write permission' -e 'write (the clipboard as «class PNGf») to f' -e 'close access f' -e 'end run' \"$0\" 2>/dev/null || " +
   '(command -v wl-paste >/dev/null && wl-paste --type image/png > "$0") || ' +
-  'xclip -selection clipboard -t image/png -o > "$0" 2>/dev/null; [ -s "$0" ] && echo "$0"'
+  'xclip -selection clipboard -t image/png -o > "$0" 2>/dev/null; [ -s "$0" ] || exit 3; echo "$0"; ' +
+  'command -v sips >/dev/null && sips -s format jpeg -Z 480 "$0" --out "$0.jpg" >/dev/null && base64 < "$0.jpg" | tr -d "\\n"'
 
-const grabScreenshot = async ($: EngineInterface) => {
+const grabScreenshot = async ($: EngineInterface): Promise<Shot | undefined> => {
   const isWindows = (await $.env.get('OS')) === 'Windows_NT'
   const argv = isWindows
     ? ['powershell', '-NoProfile', '-STA', '-Command', PS_GRAB]
     : ['sh', '-c', SH_GRAB, `/tmp/coop-shot-${Date.now()}.png`]
   const res = await $.process.run(argv, { timeoutMs: 15000 }).catch(() => undefined)
-  const path = res?.exitCode === 0 ? res.stdout.trim() : ''
+  if (res?.exitCode !== 0) return undefined
+  const [path, base64] = res.stdout.trim().split(/\r?\n/)
+  if (!path) return undefined
+  // ponytail: previews over ~90 KB are dropped to fit an Svg's 131072-character source.
+  const preview = base64 && base64.length < 90_000 ? `data:image/jpeg;base64,${base64.trim()}` : undefined
 
-  return path || undefined
+  return { path, preview }
 }
 
 const attachScreenshot = async ($: EngineInterface) => {
-  const path = await grabScreenshot($)
-  if (!path) return $.ui.toast('No image on the clipboard. Copy a screenshot first (Win+Shift+S on Windows).')
-  await update($, shots, list => [...list, path])
+  const shot = await grabScreenshot($)
+  if (!shot) return $.ui.toast('No image on the clipboard. Copy a screenshot first (Win+Shift+S on Windows).')
+  await update($, shots, list => [...list, shot])
 }
 
 // The text your Claude gets: the message, then each screenshot's path to open with Read.
 export const withShots = (text: string, paths: readonly string[]) =>
   paths.length ? `${text}\n\nScreenshots attached (open each with the Read tool):\n${paths.map(p => `- ${p}`).join('\n')}` : text
 
+// Peers' previews arrive from the relay: only a plain base64 JPEG goes into the SVG markup.
+const isPreview = (src: string | undefined): src is string =>
+  !!src && src.length < 120_000 && /^data:image\/jpeg;base64,[A-Za-z0-9+/=]+$/.test(src)
+
+// A preview as an SVG image, letterboxed into a fixed 480x300 box.
+const previewSvg = (src: string) =>
+  `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 300"><image href="${src}" width="480" height="300" preserveAspectRatio="xMidYMid meet"/></svg>`
+
 const roomUrl = (cfg: CoopConfig) => `${cfg.server.replace(/\/+$/, '')}/rooms/${encodeURIComponent(cfg.room)}`
 
-const post = async ($: EngineInterface, kind: 'prompt' | 'answer' | 'typing', text = '') => {
+const post = async ($: EngineInterface, kind: 'prompt' | 'answer' | 'typing', text = '', images: string[] = []) => {
   const cfg = await read($, config)
   if (!cfg) return
   try {
     await $.http.fetch(roomUrl(cfg), {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-coop-secret': cfg.secret },
-      body: JSON.stringify({ from: cfg.name, kind, text }),
+      body: JSON.stringify(images.length ? { from: cfg.name, kind, text, images } : { from: cfg.name, kind, text }),
     })
   } catch {
     $.ui.status('coop: relay unreachable')
@@ -142,8 +158,9 @@ const catchUp = ($: EngineInterface, text: string) => {
   return note
 }
 
-// The room is told of a prompt once, at its turn's start; a pane send names its clean text here.
+// The room is told of a prompt once, at its turn's start; a pane send names its clean text and previews here.
 let paneText: string | undefined
+let paneImages: string[] = []
 let lastTurnId = ''
 
 // The engine skips this plugin's own prompt.submit hook for a prompt it submits,
@@ -151,13 +168,15 @@ let lastTurnId = ''
 // ponytail: inline note shows in the transcript; move it to $.session.append once this build ships it.
 const sendFromPane = async ($: EngineInterface, text: string) => {
   await update($, sent, n => n + 1)
-  const paths = await read($, shots)
+  const attached = await read($, shots)
   await update($, shots, () => [])
   const note = await catchUp($, text)
   const name = (await read($, config))?.name ?? 'Your user'
-  // Peers' panes can't draw images, so the room hears that there were some.
-  paneText = paths.length ? `${text}\n📎 ${paths.length} screenshot${paths.length > 1 ? 's' : ''}` : text
-  const full = withShots(text, paths)
+  // The marker stays in the text for surfaces that draw no previews, and for peers' Claudes.
+  const n = attached.length
+  paneText = n ? `${text}\n📎 ${n} screenshot${n > 1 ? 's' : ''}` : text
+  paneImages = attached.flatMap(s => (s.preview ? [s.preview] : []))
+  const full = withShots(text, attached.map(s => s.path))
   await $.prompt.submit(note ? { text: `${note}\n\n---\n\n${name} says:\n${full}` } : { text: full, asUser: true })
 }
 
@@ -213,8 +232,10 @@ export const register: Register = on => {
     if (e.agentId || !e.text || e.turnId === lastTurnId) return next(e)
     lastTurnId = e.turnId
     const text = paneText ?? e.text
+    const images = paneImages
     paneText = undefined
-    await post($, 'prompt', text)
+    paneImages = []
+    await post($, 'prompt', text, images)
 
     return next(e)
   })
@@ -235,7 +256,7 @@ export const register: Register = on => {
   // The pane's message box: typing marks you as typing, Enter sends to your Claude.
   // These hooks answer for themselves: their writes redraw the pane, which drops
   // the element's own (empty) handler, so passing on to it would throw.
-  on('ui.input', { plugin: 'claude-coop', element: 'ask' }, async ($, e) => {
+  on('ui.input', { plugin: 'claude-coop', element: /^ask-/ }, async ($, e) => {
     if (e.kind !== 'submit') markTyping($)
     else if (e.value.trim()) await sendFromPane($, e.value)
 
@@ -260,20 +281,33 @@ export const register: Register = on => {
     if (!cfg) return <Text dimColor>Not in a room. {USAGE}</Text>
     const list = await read($, events)
     const who = await read($, typing)
-    // Read so each send redraws the field empty.
-    await read($, sent)
+    // A new key per send draws a fresh, empty field; the same key keeps what was typed.
+    const field = `ask-${await read($, sent)}`
     // Mobile draws no Input; there the main prompt box still works.
     const { Input } = e.surface === 'mobile' ? { Input: undefined } : $.ui.resolve(e)
+    // The terminal draws no Svg; there the 📎 line in the text stands in.
+    const { Svg } = e.surface === 'terminal' ? { Svg: undefined } : $.ui.resolve(e)
+    const previews = (images: readonly (string | undefined)[], width: number) =>
+      Svg && (
+        <Box flexDirection="row" flexWrap="wrap" gap={1}>
+          {images.filter(isPreview).map(src => (
+            <Svg alt="screenshot" width={width} source={previewSvg(src)} />
+          ))}
+        </Box>
+      )
     const bubble = Math.max(20, Math.floor(e.props.bodyColumns * 0.8))
-    const attached = (await read($, shots)).length
+    const attached = await read($, shots)
     // Centred and as wide as a bubble, like Claude's own prompt box.
     const box =
       Input && (
         <Box flexDirection="column" alignSelf="center" width={bubble} borderStyle="round" borderDimColor paddingX={1}>
-          <Input key="ask" value="" rows={3} placeholder="Message your Claude…" submitLabel="send" onSubmit={() => {}} />
+          {attached.length > 0 && previews(attached.map(s => s.preview), 120)}
+          <Input key={field} value="" rows={3} placeholder="Message your Claude…" submitLabel="send" onSubmit={() => {}} />
           <Box flexDirection="row" gap={1}>
             <Button key="paste" label="📎 Paste screenshot" onPress={() => {}} />
-            {attached > 0 && <Button key="clear-shots" plain label={`${attached} attached ✕`} onPress={() => {}} />}
+            {attached.length > 0 && (
+              <Button key="clear-shots" plain label={`${attached.length} attached ✕`} onPress={() => {}} />
+            )}
           </Box>
         </Box>
       )
@@ -298,6 +332,7 @@ export const register: Register = on => {
             >
               <Text bold color={isMine ? 'green' : 'blue'}>{label}</Text>
               <Text>{m.text.length > 1500 ? `${m.text.slice(0, 1500)}…` : m.text}</Text>
+              {m.images?.length ? previews(m.images, 240) : null}
             </Box>
           )
         })}

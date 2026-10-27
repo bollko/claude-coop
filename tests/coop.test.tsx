@@ -52,7 +52,7 @@ test("pane shows bubbles and who is typing; peers' turns reach your Claude once"
   }
 
   const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  await pane.input({ key: 'ask', text: 'hello from the pane' })
+  await pane.input({ key: 'ask-0', text: 'hello from the pane' })
   expect(submitted).toContain('hello from the pane')
   expect(submitted).toContain("Jason's Claude answered:\nDone, see login.tsx")
   expect(submitted).not.toContain('add a login page')
@@ -116,7 +116,7 @@ test('a screenshot pasted in the pane goes to your Claude as a file, and the roo
   on('env.get', () => ({ value: 'Windows_NT' }))
   const shot = 'C:/Temp/coop-shot-1.png'
   on('process.run', () => ({
-    value: { exitCode: 0, stdout: `${shot}\r\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
+    value: { exitCode: 0, stdout: `${shot}\r\n/9j/4AAQ\r\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
   }))
   on('http.fetch', (_, e) => {
     if (e.init?.method === 'POST') posts.push(e.init.body ?? '')
@@ -133,12 +133,18 @@ test('a screenshot pasted in the pane goes to your Claude as a file, and the roo
   const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await pane.press({ key: 'paste' })
   expect(await pane.find({ type: 'Button', text: /1 attached/ })).toBeDefined()
-  await pane.input({ key: 'ask', text: 'what is wrong here?' })
+  // The preview shows in the composer before sending.
+  expect(await pane.find({ type: 'Svg' })).toBeDefined()
+  await pane.input({ key: 'ask-0', text: 'what is wrong here?' })
+  // A fresh field replaces the one that was sent from, so the text clears.
+  expect(await pane.find({ key: 'ask-0' })).toBeUndefined()
+  expect(await pane.find({ key: 'ask-1' })).toBeDefined()
   expect(submitted).toContain('what is wrong here?')
   expect(submitted).toContain(`- ${shot}`)
   await $.turn.start({ text: submitted, turnId: 't1' })
-  const prompts = posts.map(p => JSON.parse(p) as { kind: string; text: string }).filter(p => p.kind === 'prompt')
+  const prompts = posts.map(p => JSON.parse(p) as { kind: string; text: string; images?: string[] }).filter(p => p.kind === 'prompt')
   expect(prompts.map(p => p.text)).toEqual(['what is wrong here?\n📎 1 screenshot'])
+  expect(prompts[0]?.images).toEqual(['data:image/jpeg;base64,/9j/4AAQ'])
   // Sent once: the next message carries none.
   expect(await pane.find({ type: 'Button', text: /attached/ })).toBeUndefined()
   await pane.unmount()

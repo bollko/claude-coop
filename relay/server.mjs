@@ -7,6 +7,8 @@ const KINDS = new Set(['prompt', 'answer', 'typing'])
 // ponytail: in-memory rooms, lost on restart; add a JSON file or SQLite when rooms must persist.
 const rooms = new Map()
 
+const isPreview = src => typeof src === 'string' && src.length < 120_000 && /^data:image\/jpeg;base64,[A-Za-z0-9+/=]+$/.test(src)
+
 const send = (res, status, body) => {
   res.writeHead(status, { 'content-type': 'application/json' })
   res.end(JSON.stringify(body))
@@ -43,9 +45,13 @@ createServer(async (req, res) => {
   } catch {
     return send(res, 400, { error: 'bad JSON' })
   }
-  const { from, kind, text = '' } = event
+  const { from, kind, text = '', images = [] } = event
   if (typeof from !== 'string' || !from || from.length > 40 || !KINDS.has(kind) || typeof text !== 'string') {
     return send(res, 400, { error: 'need from, kind (prompt|answer|typing), text' })
+  }
+  // Screenshot previews: up to 4 small base64 JPEGs.
+  if (!Array.isArray(images) || images.length > 4 || !images.every(isPreview)) {
+    return send(res, 400, { error: 'images must be up to 4 data:image/jpeg;base64 previews' })
   }
 
   if (kind === 'typing') {
@@ -53,6 +59,6 @@ createServer(async (req, res) => {
     return send(res, 200, {})
   }
   room.typing.delete(from)
-  room.events.push({ seq: room.events.length + 1, from, kind, text, at: Date.now() })
+  room.events.push({ seq: room.events.length + 1, from, kind, text, at: Date.now(), ...(images.length && { images }) })
   send(res, 200, { seq: room.events.length })
 }).listen(Number(process.env.PORT) || 8787, () => console.log(`coop relay on :${Number(process.env.PORT) || 8787}`))
