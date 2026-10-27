@@ -4,7 +4,7 @@ A Claude Code mod for sharing one live chat with friends. Everyone prompts their
 
 - Your prompts and your Claude's replies show on the left, your peers' on the right.
 - "Jason is typing..." shows when a peer types.
-- Before each of your prompts, your Claude is told what your peers' Claudes did since your last turn.
+- Before each of your prompts, your Claude is told what your peers' Claudes did since your last turn. Updates over 4,000 characters are condensed by Haiku first, a small extra call on your account.
 - A message box in the pane lets you talk to your Claude from there.
 
 ## Install

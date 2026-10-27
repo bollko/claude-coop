@@ -69,3 +69,38 @@ test("pane shows bubbles and who is typing; peers' turns reach your Claude once"
   expect(context).toBeUndefined()
   expect(promptPosts('now add logout')).toHaveLength(1)
 })
+
+test('a large room update reaches your Claude condensed by Haiku', async ($, on) => {
+  const clock = mock.clock(on)
+  mock.store(on)
+  const big = { seq: 1, from: 'Jason', kind: 'answer', text: 'x'.repeat(6000), at: 1 }
+  on('command.register', () => ({ value: { command: 'coop' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('ui.status', () => ({ value: undefined }))
+  on('http.fetch', (_, e) => ({
+    value: { status: 200, ok: true, headers: {}, text: JSON.stringify(e.init?.method === 'POST' ? {} : { events: [big], typing: [] }) },
+  }))
+  let asked = ''
+  on('model.complete', (_, e) => {
+    asked = e.model
+    const usage = { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
+
+    return { value: { isAnswered: true as const, text: '- Jason rewrote auth.ts', usage } }
+  })
+  const contexts: (readonly string[] | undefined)[] = []
+  on('prompt.submit', (_, e) => (contexts.push(e.context), { text: e.text }))
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.command.run({ command: 'coop', args: 'join http://relay room s Euan', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 120 } })
+  await clock.advance(1100)
+  // The same prompt twice, as the desktop host sends it: both get the summary.
+  await $.prompt.submit({ text: 'go on', wait: false, origin: { kind: 'composer' } })
+  await $.prompt.submit({ text: 'go on', wait: false, origin: { kind: 'composer' } })
+
+  expect(asked).toBe('haiku')
+  for (const context of contexts) {
+    expect(context?.join()).toContain('- Jason rewrote auth.ts')
+    expect(context?.join()).not.toContain('xxxx')
+  }
+})

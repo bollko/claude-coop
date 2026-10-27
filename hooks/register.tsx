@@ -68,18 +68,41 @@ export const missedContext = (list: CoopEvent[], from: number, me: string, room:
   return `Co-op room "${room}". Your user ${me} shares this chat with peers who run their own Claude sessions. What happened in the room since your last turn:\n\n${lines.join('\n\n---\n\n')}`
 }
 
+// Updates over this many characters are condensed by Haiku before your Claude reads them.
+const SUMMARY_OVER = 4000
+const SUMMARY_RULES =
+  "You condense a log of what other people's Claude Code sessions did in a shared co-op room, for another Claude working on the same project. Keep who asked for what, which files changed and how, decisions, commands, errors, open questions, and exact names and paths. Drop pleasantries and repetition. Plain bullet points, under 250 words."
+
+const condense = async ($: EngineInterface, note: string, room: string) => {
+  if (note.length <= SUMMARY_OVER) return note
+  // A refused request rejects; fall through to the cut note rather than lose the update.
+  const res = await $.model
+    .complete({ model: 'haiku', system: SUMMARY_RULES, prompt: note, maxTokens: 800, timeoutMs: 20000 })
+    .catch(() => undefined)
+  if (res?.isAnswered && res.text.trim()) {
+    return `Co-op room "${room}": what peers' Claude sessions did since your last turn, condensed:\n\n${res.text.trim()}`
+  }
+
+  return `${note.slice(0, SUMMARY_OVER)}\n\n…(room update cut short)`
+}
+
 // The desktop host can raise prompt.submit twice for one prompt, so the same
 // text within a few seconds gets the same note back instead of an empty one.
-let lastCatchUp = { text: '', at: 0, note: undefined as string | undefined }
+// The promise is cached before any await, so a twin arriving mid-summary waits on it.
+let lastCatchUp = { text: '', at: 0, note: Promise.resolve(undefined as string | undefined) }
 
 // What peers did since this Claude last heard; marks it as heard.
-const catchUp = async ($: EngineInterface, text: string) => {
-  const cfg = await read($, config)
-  if (!cfg) return undefined
+const catchUp = ($: EngineInterface, text: string) => {
   if (text === lastCatchUp.text && Date.now() - lastCatchUp.at < 5000) return lastCatchUp.note
-  const list = await read($, events)
-  const note = missedContext(list, await read($, fed), cfg.name, cfg.room)
-  await update($, fed, () => list.length)
+  const note = (async () => {
+    const cfg = await read($, config)
+    if (!cfg) return undefined
+    const list = await read($, events)
+    const raw = missedContext(list, await read($, fed), cfg.name, cfg.room)
+    await update($, fed, () => list.length)
+
+    return raw && (await condense($, raw, cfg.room))
+  })()
   lastCatchUp = { text, at: Date.now(), note }
 
   return note
