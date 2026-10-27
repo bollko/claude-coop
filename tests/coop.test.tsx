@@ -104,3 +104,42 @@ test('a large room update reaches your Claude condensed by Haiku', async ($, on)
     expect(context?.join()).not.toContain('xxxx')
   }
 })
+
+test('a screenshot pasted in the pane goes to your Claude as a file, and the room hears of it', async ($, on) => {
+  const clock = mock.clock(on)
+  mock.store(on)
+  const posts: string[] = []
+  on('command.register', () => ({ value: { command: 'coop' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('ui.status', () => ({ value: undefined }))
+  on('env.get', () => ({ value: 'Windows_NT' }))
+  const shot = 'C:/Temp/coop-shot-1.png'
+  on('process.run', () => ({
+    value: { exitCode: 0, stdout: `${shot}\r\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
+  }))
+  on('http.fetch', (_, e) => {
+    if (e.init?.method === 'POST') posts.push(e.init.body ?? '')
+    return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(e.init?.method === 'POST' ? {} : { events: [], typing: [] }) } }
+  })
+  let submitted = ''
+  on('prompt.submit', (_, e) => ((submitted = e.text), { text: e.text }))
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.command.run({ command: 'coop', args: 'join http://relay room s Euan', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 120 } })
+  await clock.advance(1100)
+
+  const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await pane.press({ key: 'paste' })
+  expect(await pane.find({ type: 'Button', text: /1 attached/ })).toBeDefined()
+  await pane.input({ key: 'ask', text: 'what is wrong here?' })
+  expect(submitted).toContain('what is wrong here?')
+  expect(submitted).toContain(`- ${shot}`)
+  await $.turn.start({ text: submitted, turnId: 't1' })
+  const prompts = posts.map(p => JSON.parse(p) as { kind: string; text: string }).filter(p => p.kind === 'prompt')
+  expect(prompts.map(p => p.text)).toEqual(['what is wrong here?\n📎 1 screenshot'])
+  // Sent once: the next message carries none.
+  expect(await pane.find({ type: 'Button', text: /attached/ })).toBeUndefined()
+  await pane.unmount()
+})

@@ -9,6 +9,7 @@ declare module 'claude-code' {
       typing: string[]
       fed: number
       sent: number
+      shots: string[]
     }
   }
 }

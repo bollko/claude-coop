@@ -11,6 +11,40 @@ const typing = atom({ plugin: 'claude-coop', key: 'typing' } as const, [])
 // How many room events this session's Claude has already been given as context.
 const fed = atom({ plugin: 'claude-coop', key: 'fed' } as const, 0)
 const sent = atom({ plugin: 'claude-coop', key: 'sent' } as const, 0)
+// Screenshot files waiting to go with the next pane message.
+const shots = atom({ plugin: 'claude-coop', key: 'shots' } as const, [])
+
+// A pane field takes no pasted images, so the button reads the clipboard through the OS.
+const PS_GRAB =
+  'Add-Type -AssemblyName System.Windows.Forms,System.Drawing; $i = [Windows.Forms.Clipboard]::GetImage(); if (-not $i) { exit 3 }; ' +
+  "$p = Join-Path $env:TEMP ('coop-shot-' + [guid]::NewGuid() + '.png'); $i.Save($p, [Drawing.Imaging.ImageFormat]::Png); $p"
+// macOS (pngpaste or AppleScript), then Linux (wl-paste or xclip); $0 is the file to write.
+const SH_GRAB =
+  '(command -v pngpaste >/dev/null && pngpaste "$0") || ' +
+  "osascript -e 'on run a' -e 'set f to open for access (POSIX file (item 1 of a)) with write permission' -e 'write (the clipboard as «class PNGf») to f' -e 'close access f' -e 'end run' \"$0\" 2>/dev/null || " +
+  '(command -v wl-paste >/dev/null && wl-paste --type image/png > "$0") || ' +
+  'xclip -selection clipboard -t image/png -o > "$0" 2>/dev/null; [ -s "$0" ] && echo "$0"'
+
+const grabScreenshot = async ($: EngineInterface) => {
+  const isWindows = (await $.env.get('OS')) === 'Windows_NT'
+  const argv = isWindows
+    ? ['powershell', '-NoProfile', '-STA', '-Command', PS_GRAB]
+    : ['sh', '-c', SH_GRAB, `/tmp/coop-shot-${Date.now()}.png`]
+  const res = await $.process.run(argv, { timeoutMs: 15000 }).catch(() => undefined)
+  const path = res?.exitCode === 0 ? res.stdout.trim() : ''
+
+  return path || undefined
+}
+
+const attachScreenshot = async ($: EngineInterface) => {
+  const path = await grabScreenshot($)
+  if (!path) return $.ui.toast('No image on the clipboard. Copy a screenshot first (Win+Shift+S on Windows).')
+  await update($, shots, list => [...list, path])
+}
+
+// The text your Claude gets: the message, then each screenshot's path to open with Read.
+export const withShots = (text: string, paths: readonly string[]) =>
+  paths.length ? `${text}\n\nScreenshots attached (open each with the Read tool):\n${paths.map(p => `- ${p}`).join('\n')}` : text
 
 const roomUrl = (cfg: CoopConfig) => `${cfg.server.replace(/\/+$/, '')}/rooms/${encodeURIComponent(cfg.room)}`
 
@@ -117,10 +151,14 @@ let lastTurnId = ''
 // ponytail: inline note shows in the transcript; move it to $.session.append once this build ships it.
 const sendFromPane = async ($: EngineInterface, text: string) => {
   await update($, sent, n => n + 1)
+  const paths = await read($, shots)
+  await update($, shots, () => [])
   const note = await catchUp($, text)
   const name = (await read($, config))?.name ?? 'Your user'
-  paneText = text
-  await $.prompt.submit(note ? { text: `${note}\n\n---\n\n${name} says:\n${text}` } : { text, asUser: true })
+  // Peers' panes can't draw images, so the room hears that there were some.
+  paneText = paths.length ? `${text}\n📎 ${paths.length} screenshot${paths.length > 1 ? 's' : ''}` : text
+  const full = withShots(text, paths)
+  await $.prompt.submit(note ? { text: `${note}\n\n---\n\n${name} says:\n${full}` } : { text: full, asUser: true })
 }
 
 export const register: Register = on => {
@@ -202,8 +240,20 @@ export const register: Register = on => {
     return next(e)
   })
 
+  on('ui.press', { plugin: 'claude-coop', element: 'paste' }, async ($, e, next) => {
+    await attachScreenshot($)
+
+    return next(e)
+  })
+
+  on('ui.press', { plugin: 'claude-coop', element: 'clear-shots' }, async ($, e, next) => {
+    await update($, shots, () => [])
+
+    return next(e)
+  })
+
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text } = $.ui.resolve(e)
+    const { Box, Text, Button } = $.ui.resolve(e)
     const cfg = await read($, config)
     if (!cfg) return <Text dimColor>Not in a room. {USAGE}</Text>
     const list = await read($, events)
@@ -213,11 +263,16 @@ export const register: Register = on => {
     // Mobile draws no Input; there the main prompt box still works.
     const { Input } = e.surface === 'mobile' ? { Input: undefined } : $.ui.resolve(e)
     const bubble = Math.max(20, Math.floor(e.props.bodyColumns * 0.8))
+    const attached = (await read($, shots)).length
     // Centred and as wide as a bubble, like Claude's own prompt box.
     const box =
       Input && (
         <Box flexDirection="column" alignSelf="center" width={bubble} borderStyle="round" borderDimColor paddingX={1}>
           <Input key="ask" value="" rows={3} placeholder="Message your Claude…" submitLabel="send" onSubmit={() => {}} />
+          <Box flexDirection="row" gap={1}>
+            <Button key="paste" label="📎 Paste screenshot" onPress={() => {}} />
+            {attached > 0 && <Button key="clear-shots" plain label={`${attached} attached ✕`} onPress={() => {}} />}
+          </Box>
         </Box>
       )
 
