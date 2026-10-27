@@ -672,7 +672,7 @@ export const register: Register = on => {
       Svg && (
         <Box flexDirection="row" flexWrap="wrap" gap={1}>
           {images.filter(isPreview).map(src => (
-            <Svg alt="screenshot" width={width} source={previewSvg(src)} />
+            <Svg alt="screenshot" width={width} height={Math.round((width * 300) / 480)} isInteractive source={previewSvg(src)} />
           ))}
         </Box>
       )
@@ -739,7 +739,7 @@ export const register: Register = on => {
             >
               <Box flexDirection="row" alignItems="center" gap={1}>
                 {Svg && (
-                  <Svg alt="" width={18} height={18} source={m.kind === 'prompt' ? avatarSvg(m.from) : CLAUDE_AVATAR} />
+                  <Svg alt="avatar" width={18} height={18} isInteractive source={m.kind === 'prompt' ? avatarSvg(m.from) : CLAUDE_AVATAR} />
                 )}
                 <Text bold color={isMine ? 'green' : 'blue'}>
                   {label}
@@ -754,7 +754,7 @@ export const register: Register = on => {
           (Svg ? (
             <Box flexDirection="row" alignItems="center" gap={1}>
               {who.map(name => (
-                <Svg alt="" width={18} height={18} source={avatarSvg(name)} />
+                <Svg alt={name} width={18} height={18} isInteractive source={avatarSvg(name)} />
               ))}
               <Text dimColor italic>
                 {who.join(', ')} {who.length > 1 ? 'are' : 'is'} typing
