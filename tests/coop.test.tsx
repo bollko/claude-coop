@@ -105,7 +105,7 @@ test('a large room update reaches your Claude condensed by Haiku', async ($, on)
   }
 })
 
-test('a screenshot pasted in the pane goes to your Claude as a file, and the room hears of it', async ($, on) => {
+test('screenshots and picked files go to your Claude as paths, and the room hears their names', async ($, on) => {
   const clock = mock.clock(on)
   mock.store(on)
   const posts: string[] = []
@@ -115,8 +115,16 @@ test('a screenshot pasted in the pane goes to your Claude as a file, and the roo
   on('ui.status', () => ({ value: undefined }))
   on('env.get', () => ({ value: 'Windows_NT' }))
   const shot = 'C:/Temp/coop-shot-1.png'
-  on('process.run', () => ({
-    value: { exitCode: 0, stdout: `${shot}\r\n/9j/4AAQ\r\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
+  const picked = ['C:/Work/notes.txt', 'C:/Work/log.csv']
+  // The file picker answers two files; the clipboard grab answers a screenshot and its preview.
+  on('process.run', (_, e) => ({
+    value: {
+      exitCode: 0,
+      stdout: e.argv.join(' ').includes('OpenFileDialog') ? picked.join('\r\n') : `${shot}\r\n/9j/4AAQ\r\n`,
+      stderr: '',
+      isStdoutTruncated: false,
+      isStderrTruncated: false,
+    },
   }))
   on('http.fetch', (_, e) => {
     if (e.init?.method === 'POST') posts.push(e.init.body ?? '')
@@ -132,7 +140,7 @@ test('a screenshot pasted in the pane goes to your Claude as a file, and the roo
 
   const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await pane.press({ key: 'paste' })
-  expect(await pane.find({ type: 'Button', text: /1 attached/ })).toBeDefined()
+  expect(await pane.find({ type: 'Button', text: /screenshot ✕/ })).toBeDefined()
   // The preview shows in the composer before sending.
   expect(await pane.find({ type: 'Svg' })).toBeDefined()
   await pane.input({ key: 'ask-0', text: 'what is wrong here?' })
@@ -143,9 +151,18 @@ test('a screenshot pasted in the pane goes to your Claude as a file, and the roo
   expect(submitted).toContain(`- ${shot}`)
   await $.turn.start({ text: submitted, turnId: 't1' })
   const prompts = posts.map(p => JSON.parse(p) as { kind: string; text: string; images?: string[] }).filter(p => p.kind === 'prompt')
-  expect(prompts.map(p => p.text)).toEqual(['what is wrong here?\n📎 1 screenshot'])
+  expect(prompts.map(p => p.text)).toEqual(['what is wrong here?\n📎 screenshot'])
   expect(prompts[0]?.images).toEqual(['data:image/jpeg;base64,/9j/4AAQ'])
   // Sent once: the next message carries none.
-  expect(await pane.find({ type: 'Button', text: /attached/ })).toBeUndefined()
+  expect(await pane.find({ type: 'Button', text: /✕/ })).toBeUndefined()
+
+  // Files from the picker go without any text.
+  await pane.press({ key: 'attach' })
+  await pane.input({ key: 'ask-1', text: '' })
+  expect(submitted).toBe(`Attached (open each with the Read tool):
+- ${picked[0]}
+- ${picked[1]}`)
+  await $.turn.start({ text: submitted, turnId: 't2' })
+  expect(JSON.parse(posts.at(-1) ?? '{}').text).toBe('📎 notes.txt, log.csv')
   await pane.unmount()
 })

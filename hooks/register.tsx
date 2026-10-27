@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { CoopConfig, CoopEvent, Shot } from '../types'
+import type { Attachment, CoopConfig, CoopEvent } from '../types'
 
 const PANE = 'coop'
 const USAGE = '/coop join <server-url> <room> <secret> <your-name>  |  /coop leave  |  /coop'
@@ -11,7 +11,7 @@ const typing = atom({ plugin: 'claude-coop', key: 'typing' } as const, [])
 // How many room events this session's Claude has already been given as context.
 const fed = atom({ plugin: 'claude-coop', key: 'fed' } as const, 0)
 const sent = atom({ plugin: 'claude-coop', key: 'sent' } as const, 0)
-// Screenshot files waiting to go with the next pane message.
+// Screenshots and files waiting to go with the next pane message.
 const shots = atom({ plugin: 'claude-coop', key: 'shots' } as const, [])
 
 // A pane field takes no pasted images, so the button reads the clipboard through the OS.
@@ -29,7 +29,33 @@ const SH_GRAB =
   'xclip -selection clipboard -t image/png -o > "$0" 2>/dev/null; [ -s "$0" ] || exit 3; echo "$0"; ' +
   'command -v sips >/dev/null && sips -s format jpeg -Z 480 "$0" --out "$0.jpg" >/dev/null && base64 < "$0.jpg" | tr -d "\\n"'
 
-const grabScreenshot = async ($: EngineInterface): Promise<Shot | undefined> => {
+// The OS file picker, several files at once; prints one path per line, nothing on cancel.
+const PS_PICK =
+  'Add-Type -AssemblyName System.Windows.Forms; $f = New-Object Windows.Forms.Form -Property @{ TopMost = $true }; ' +
+  "$d = New-Object Windows.Forms.OpenFileDialog; $d.Multiselect = $true; $d.Title = 'Attach files for Claude'; " +
+  "if ($d.ShowDialog($f) -eq 'OK') { $d.FileNames }"
+const SH_PICK =
+  "osascript -e 'set out to \"\"' -e 'repeat with f in (choose file with multiple selections allowed)' " +
+  "-e 'set out to out & POSIX path of f & linefeed' -e 'end repeat' -e 'return out' 2>/dev/null || " +
+  'zenity --file-selection --multiple --separator="|" 2>/dev/null'
+
+const pickFiles = async ($: EngineInterface) => {
+  const isWindows = (await $.env.get('OS')) === 'Windows_NT'
+  const argv = isWindows ? ['powershell', '-NoProfile', '-STA', '-Command', PS_PICK] : ['sh', '-c', SH_PICK]
+  // Five minutes to choose.
+  const res = await $.process.run(argv, { timeoutMs: 300_000 }).catch(() => undefined)
+
+  return (res?.stdout ?? '').split(/[\r\n|]+/).map(p => p.trim()).filter(Boolean)
+}
+
+const attachFiles = async ($: EngineInterface) => {
+  const paths = await pickFiles($)
+  if (paths.length) await update($, shots, list => [...list, ...paths.map(path => ({ path, name: baseName(path) }))])
+}
+
+const baseName = (path: string) => path.split(/[\\/]/).pop() ?? path
+
+const grabScreenshot = async ($: EngineInterface): Promise<Attachment | undefined> => {
   const isWindows = (await $.env.get('OS')) === 'Windows_NT'
   const argv = isWindows
     ? ['powershell', '-NoProfile', '-STA', '-Command', PS_GRAB]
@@ -41,7 +67,7 @@ const grabScreenshot = async ($: EngineInterface): Promise<Shot | undefined> => 
   // ponytail: previews over ~90 KB are dropped to fit an Svg's 131072-character source.
   const preview = base64 && base64.length < 90_000 ? `data:image/jpeg;base64,${base64.trim()}` : undefined
 
-  return { path, preview }
+  return { path, name: 'screenshot', preview }
 }
 
 const attachScreenshot = async ($: EngineInterface) => {
@@ -50,9 +76,11 @@ const attachScreenshot = async ($: EngineInterface) => {
   await update($, shots, list => [...list, shot])
 }
 
-// The text your Claude gets: the message, then each screenshot's path to open with Read.
+// The text your Claude gets: the message, then each attachment's path to open with Read.
 export const withShots = (text: string, paths: readonly string[]) =>
-  paths.length ? `${text}\n\nScreenshots attached (open each with the Read tool):\n${paths.map(p => `- ${p}`).join('\n')}` : text
+  paths.length
+    ? `${text}\n\nAttached (open each with the Read tool):\n${paths.map(p => `- ${p}`).join('\n')}`.trim()
+    : text
 
 // Peers' previews arrive from the relay: only a plain base64 JPEG goes into the SVG markup.
 const isPreview = (src: string | undefined): src is string =>
@@ -179,8 +207,8 @@ const sendFromPane = async ($: EngineInterface, text: string) => {
   const note = await catchUp($, text)
   const name = (await read($, config))?.name ?? 'Your user'
   // The marker stays in the text for surfaces that draw no previews, and for peers' Claudes.
-  const n = attached.length
-  paneText = n ? `${text}\n📎 ${n} screenshot${n > 1 ? 's' : ''}` : text
+  const marker = attached.length ? `📎 ${attached.map(a => a.name).join(', ')}` : ''
+  paneText = [text.trim(), marker].filter(Boolean).join('\n')
   paneImages = attached.flatMap(s => (s.preview ? [s.preview] : []))
   const full = withShots(text, attached.map(s => s.path))
   await $.prompt.submit(note ? { text: `${note}\n\n---\n\n${name} says:\n${full}` } : { text: full, asUser: true })
@@ -264,9 +292,16 @@ export const register: Register = on => {
   // the element's own (empty) handler, so passing on to it would throw.
   on('ui.input', { plugin: 'claude-coop', element: /^ask-/ }, async ($, e) => {
     if (e.kind !== 'submit') markTyping($)
-    else if (e.value.trim()) await sendFromPane($, e.value)
+    // Attachments alone are worth sending; an empty field alone is not.
+    else if (e.value.trim() || (await read($, shots)).length) await sendFromPane($, e.value)
 
     return { element: e.element, value: e.value }
+  })
+
+  on('ui.press', { plugin: 'claude-coop', element: 'attach' }, async ($, e) => {
+    await attachFiles($)
+
+    return { element: e.element }
   })
 
   on('ui.press', { plugin: 'claude-coop', element: 'paste' }, async ($, e) => {
@@ -311,8 +346,9 @@ export const register: Register = on => {
           <Input key={field} value="" rows={3} placeholder="Message your Claude…" submitLabel="send" onSubmit={() => {}} />
           <Box flexDirection="row" gap={1}>
             <Button key="paste" label="📎 Paste screenshot" onPress={() => {}} />
+            <Button key="attach" label="📄 Attach files" onPress={() => {}} />
             {attached.length > 0 && (
-              <Button key="clear-shots" plain label={`${attached.length} attached ✕`} onPress={() => {}} />
+              <Button key="clear-shots" plain label={`${attached.map(a => a.name).join(', ')} ✕`} onPress={() => {}} />
             )}
           </Box>
         </Box>
