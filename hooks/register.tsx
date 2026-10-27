@@ -4,13 +4,17 @@ import type { EngineInterface, Register } from 'claude-code'
 import type { Attachment, CoopConfig, CoopEvent } from '../types'
 
 const PANE = 'coop'
-const USAGE = '/coop join <server-url> <room> <secret> <your-name>  |  /coop leave  |  /coop'
+const USAGE =
+  '/coop join <server-url> <room> <secret> <your-name> [repo-url]  |  /coop repo <url|none>  |  /coop ship  |  /coop leave  |  /coop'
 const config = atom({ plugin: 'claude-coop', key: 'config' } as const, null)
 const events = atom({ plugin: 'claude-coop', key: 'events' } as const, [])
 const typing = atom({ plugin: 'claude-coop', key: 'typing' } as const, [])
 // How many room events this session's Claude has already been given as context.
 const fed = atom({ plugin: 'claude-coop', key: 'fed' } as const, 0)
 const sent = atom({ plugin: 'claude-coop', key: 'sent' } as const, 0)
+// The room's repo as this folder stands with it, and who holds the edit lock.
+const workspace = atom({ plugin: 'claude-coop', key: 'workspace' } as const, null)
+const lock = atom({ plugin: 'claude-coop', key: 'lock' } as const, null)
 // Screenshots and files waiting to go with the next pane message.
 const shots = atom({ plugin: 'claude-coop', key: 'shots' } as const, [])
 
@@ -92,18 +96,131 @@ const previewSvg = (src: string) =>
 
 const roomUrl = (cfg: CoopConfig) => `${cfg.server.replace(/\/+$/, '')}/rooms/${encodeURIComponent(cfg.room)}`
 
-const post = async ($: EngineInterface, kind: 'prompt' | 'answer' | 'typing', text = '', images: string[] = []) => {
+type PostKind = 'prompt' | 'answer' | 'typing' | 'repo' | 'lock' | 'unlock'
+
+const post = async ($: EngineInterface, kind: PostKind, text = '', images: string[] = []) => {
   const cfg = await read($, config)
-  if (!cfg) return
+  if (!cfg) return undefined
   try {
-    await $.http.fetch(roomUrl(cfg), {
+    return await $.http.fetch(roomUrl(cfg), {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-coop-secret': cfg.secret },
       body: JSON.stringify(images.length ? { from: cfg.name, kind, text, images } : { from: cfg.name, kind, text }),
     })
   } catch {
     $.ui.status('coop: relay unreachable')
+    return undefined
   }
+}
+
+// --- Shared workspace: the room's git repo, worked on a branch of the room's own.
+
+const git = ($: EngineInterface, args: string[]) =>
+  $.process
+    .run(['git', ...args], { timeoutMs: 60_000 })
+    .catch((err: unknown) => ({ exitCode: -1, stdout: '', stderr: String(err) }))
+
+// https://github.com/a/b.git, git@github.com:a/b and github.com/a/b all name one repo.
+export const sameRepo = (a: string, b: string) => {
+  const norm = (url: string) =>
+    url
+      .trim()
+      .toLowerCase()
+      .replace(/^[a-z+]+:\/\//, '')
+      .replace(/^[^@/]+@/, '')
+      .replace(':', '/')
+      .replace(/\.git$/, '')
+      .replace(/\/+$/, '')
+
+  return norm(a) === norm(b)
+}
+
+export const branchFor = (room: string) => `coop/${room}`
+
+// Puts this session's folder on the room branch, if the folder is a clone of the room's repo.
+const setupWorkspace = async ($: EngineInterface, repo: string, room: string) => {
+  const branch = branchFor(room)
+  const set = (ok: boolean, note: string) => update($, workspace, () => ({ repo, ok, note }))
+  const origin = await git($, ['remote', 'get-url', 'origin'])
+  if (origin.exitCode !== 0) return set(false, `This folder isn't a git repo. Clone ${repo} and open Claude in it.`)
+  if (!sameRepo(origin.stdout, repo)) return set(false, `This folder is a clone of ${origin.stdout.trim()}, not ${repo}.`)
+  await git($, ['fetch', 'origin'])
+  const current = (await git($, ['branch', '--show-current'])).stdout.trim()
+  if (current !== branch) {
+    const hasLocal = (await git($, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`])).exitCode === 0
+    const hasRemote = (await git($, ['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${branch}`])).exitCode === 0
+    const args = hasLocal ? ['switch', branch] : hasRemote ? ['switch', '--track', `origin/${branch}`] : ['switch', '-c', branch]
+    const res = await git($, args)
+    if (res.exitCode !== 0) return set(false, `Couldn't switch to ${branch}: ${res.stderr.trim().split('\n')[0]}`)
+    if (!hasLocal && !hasRemote) await git($, ['push', '-u', 'origin', branch])
+  }
+
+  return set(true, `Shared files on ${branch}`)
+}
+
+// Follows the room's repo: set up when it appears or changes, forgotten when it is cleared.
+let isSyncing = false
+const syncWorkspace = async ($: EngineInterface, repo: string | null, room: string) => {
+  const ws = await read($, workspace)
+  if (isSyncing || (ws?.repo ?? null) === repo) return
+  isSyncing = true
+  try {
+    if (repo) await setupWorkspace($, repo, room)
+    else await update($, workspace, () => null)
+  } finally {
+    isSyncing = false
+  }
+}
+
+// The edit lock this session holds, so the turn's end knows to commit and release it.
+let holding: { prompt: string; at: number } | undefined
+let lastLockAt = 0
+
+// Before a turn: take the edit lock and pull peers' changes. Returns why not, when a peer holds it.
+const beginTurn = async ($: EngineInterface, prompt: string) => {
+  const ws = await read($, workspace)
+  const cfg = await read($, config)
+  if (!ws?.ok || !cfg) return undefined
+  const res = await post($, 'lock')
+  if (res?.status === 409) {
+    const holder = (JSON.parse(res.text) as { holder?: string }).holder ?? 'Someone'
+    return `${holder}'s Claude is editing the shared files. Send again when it finishes.`
+  }
+  // A turn of ours is already under way (or this is the desktop host's twin of its prompt): no pull mid-turn.
+  // ponytail: a prompt queued mid-turn has its changes committed with the next turn's.
+  if (holding) return undefined
+  holding = { prompt, at: Date.now() }
+  lastLockAt = Date.now()
+  const pulled = await git($, ['pull', '--rebase', '--autostash', 'origin', branchFor(cfg.room)])
+  if (pulled.exitCode !== 0) $.ui.toast(`coop: couldn't pull peers' changes: ${pulled.stderr.trim().split('\n')[0]}`)
+
+  return undefined
+}
+
+// After a turn: commit what changed, push it to the room branch, release the lock.
+const endTurn = async ($: EngineInterface) => {
+  const cfg = await read($, config)
+  if (!holding || !cfg) return
+  const { prompt } = holding
+  holding = undefined
+  const branch = branchFor(cfg.room)
+  await git($, ['add', '-A'])
+  const hasChanges = (await git($, ['diff', '--cached', '--quiet'])).exitCode === 1
+  if (hasChanges) {
+    const subject = prompt.split('\n')[0]?.slice(0, 60) || 'changes'
+    await git($, ['commit', '-m', `coop(${cfg.name}): ${subject}`])
+    let pushed = await git($, ['push', 'origin', branch])
+    if (pushed.exitCode !== 0) {
+      // A peer pushed first: replay ours on theirs, or stop and leave it to the person.
+      const rebased = await git($, ['pull', '--rebase', 'origin', branch])
+      if (rebased.exitCode !== 0) {
+        await git($, ['rebase', '--abort'])
+        $.ui.toast(`coop: your changes clash with a peer's on ${branch}. Resolve with git pull, then push.`)
+      } else pushed = await git($, ['push', 'origin', branch])
+    }
+    if (pushed.exitCode === 0) $.ui.toast(`coop: pushed your Claude's changes to ${branch}`)
+  }
+  await post($, 'unlock')
 }
 
 let lastTypingPost = 0
@@ -124,7 +241,23 @@ const poll = async ($: EngineInterface) => {
     const res = await $.http.fetch(`${roomUrl(cfg)}?since=${since}`, { headers: { 'x-coop-secret': cfg.secret } })
     if (!res.ok) return $.ui.status(`coop: relay said ${res.status}`)
     $.ui.status(`coop: ${cfg.room}`)
-    const body = JSON.parse(res.text) as { events: CoopEvent[]; typing: string[]; total?: number }
+    const body = JSON.parse(res.text) as {
+      events: CoopEvent[]
+      typing: string[]
+      total?: number
+      repo?: string | null
+      lock?: string | null
+    }
+    await syncWorkspace($, body.repo ?? null, cfg.room)
+    const holder = body.lock ?? null
+    if (holder !== (await read($, lock))) await update($, lock, () => holder)
+    // Keep the lock alive through a long turn; the relay frees one left for 15 minutes.
+    // An hour on, assume the turn's end was missed and stop holding peers off.
+    if (holding && Date.now() - holding.at > 60 * 60_000) holding = undefined
+    if (holding && Date.now() - lastLockAt > 5 * 60_000) {
+      lastLockAt = Date.now()
+      void post($, 'lock')
+    }
     // Fewer events than we hold: the relay restarted and the room is new.
     if (body.total !== undefined && body.total < since) {
       await update($, events, () => [])
@@ -201,8 +334,11 @@ let lastTurnId = ''
 // so the pane puts the peers' turns ahead of the text itself.
 // ponytail: inline note shows in the transcript; move it to $.session.append once this build ships it.
 const sendFromPane = async ($: EngineInterface, text: string) => {
-  await update($, sent, n => n + 1)
   const attached = await read($, shots)
+  // A peer editing the shared files: keep the draft's attachments and say so.
+  const busy = await beginTurn($, text || attached.map(a => a.name).join(', '))
+  if (busy) return $.ui.toast(busy)
+  await update($, sent, n => n + 1)
   await update($, shots, () => [])
   const note = await catchUp($, text)
   const name = (await read($, config))?.name ?? 'Your user'
@@ -226,13 +362,15 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: 'coop' }, async ($, e) => {
-    const [verb, server, room, secret, name] = e.args.trim().split(/\s+/)
+    const [verb, server, room, secret, name, repo] = e.args.trim().split(/\s+/)
     if (verb === 'leave') {
       await $.store.delete('config')
       await update($, config, () => null)
       await update($, events, () => [])
       await update($, typing, () => [])
       await update($, fed, () => 0)
+      await update($, workspace, () => null)
+      await update($, lock, () => null)
       $.ui.status(undefined)
 
       return { text: 'Left the co-op room.' }
@@ -244,12 +382,32 @@ export const register: Register = on => {
       await update($, config, () => cfg)
       await update($, events, () => [])
       await update($, fed, () => 0)
+      await update($, workspace, () => null)
+      // Joining with a repo sets the room's; the next poll puts this folder on its branch.
+      if (repo) await post($, 'repo', repo)
       await $.ui.open({ id: PANE, title: `Co-op: ${room}` })
 
-      return { text: `Joined co-op room ${room} as ${name}.` }
+      return { text: `Joined co-op room ${room} as ${name}.${repo ? ` Shared repo: ${repo}` : ''}` }
     }
     const cfg = await read($, config)
     if (!cfg) return { text: `Not in a room. ${USAGE}` }
+    if (verb === 'repo') {
+      // `/coop repo <url>` sets the room's shared repo; `/coop repo none` clears it.
+      const url = server && server !== 'none' ? server : ''
+      await post($, 'repo', url)
+
+      return { text: url ? `Room repo set to ${url}. Everyone's folder moves to ${branchFor(cfg.room)}.` : 'Room repo cleared.' }
+    }
+    if (verb === 'ship') {
+      const ws = await read($, workspace)
+      if (!ws?.ok) return { text: `No shared repo to ship from. ${ws?.note ?? 'Set one with /coop repo <url>.'}` }
+      // Your Claude finds and runs the project's tests; only a green run becomes a pull request.
+      await $.prompt.submit({
+        text: `Ship the co-op room's work: run this project's tests on branch ${branchFor(cfg.room)}. If they pass, open a pull request from ${branchFor(cfg.room)} into the default branch with gh pr create, summarising the room's changes. If any fail, report them and do not open a pull request.`,
+      })
+
+      return { text: 'Asked your Claude to test the room branch and open a pull request if the tests pass.' }
+    }
     await $.ui.open({ id: PANE, title: `Co-op: ${cfg.room}` })
 
     return { text: `Co-op pane opened for room ${cfg.room}.` }
@@ -257,6 +415,8 @@ export const register: Register = on => {
 
   on('prompt.submit', async ($, e, next) => {
     if (e.command || e.isMeta || !(await read($, config))) return next(e)
+    const busy = await beginTurn($, e.text)
+    if (busy) return { drop: busy }
     const note = await catchUp($, e.text)
 
     return next(note ? { ...e, context: [...(e.context ?? []), note] } : e)
@@ -276,7 +436,10 @@ export const register: Register = on => {
 
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
-    if (!e.agentId && e.reason === 'answer' && e.answer) await post($, 'answer', e.answer)
+    if (e.agentId) return result
+    if (e.reason === 'answer' && e.answer) await post($, 'answer', e.answer)
+    // Whatever the turn changed goes to the room branch, interrupted or not.
+    await endTurn($)
 
     return result
   })
@@ -354,8 +517,19 @@ export const register: Register = on => {
         </Box>
       )
 
+    const ws = await read($, workspace)
+    const holder = await read($, lock)
+
     return (
       <Box flexDirection="column" gap={1}>
+        {ws && (
+          <Text dimColor={ws.ok} color={ws.ok ? undefined : 'yellow'}>
+            📁 {ws.repo} · {ws.note}
+          </Text>
+        )}
+        {holder && (
+          <Text color="yellow">🔒 {holder === cfg.name ? 'Your' : `${holder}'s`} Claude is editing the shared files</Text>
+        )}
         {list.length === 0 && <Text dimColor>Room is empty. Send a prompt to start.</Text>}
         {list.slice(-30).map(m => {
           const isMine = m.from === cfg.name

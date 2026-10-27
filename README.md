@@ -49,6 +49,22 @@ For example `/coop join http://192.168.1.20:8787 myroom tacos42 Jason`. The firs
 - `/coop` opens the pane again.
 - `/coop leave` leaves the room.
 
+## Shared files
+
+Give the room a git repo, and everyone's Claude works on the same files:
+
+```
+/coop join <relay-url> <room> <secret> <your-name> <repo-url>
+```
+
+or later, `/coop repo <repo-url>` (`/coop repo none` clears it). Everyone else picks the repo up when they join.
+
+- Open Claude in a clone of the repo. The mod moves that folder to a branch for the room, `coop/<room>`, and never touches `main`.
+- Before each prompt, the mod takes the room's edit lock and pulls peers' changes. After the turn, it commits what changed and pushes it to the room branch, then releases the lock.
+- While someone's Claude holds the lock, the pane shows "🔒 Jason's Claude is editing the shared files" and other prompts wait.
+- If two people's changes clash, the mod stops and tells you; resolve with `git pull` and push yourself.
+- `/coop ship` asks your Claude to run the project's tests on the room branch and, only if they pass, open a pull request into `main`.
+
 ## Limits
 
 - The pane polls the relay once a second.

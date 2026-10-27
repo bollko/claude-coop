@@ -1,9 +1,11 @@
-// Claude Coop relay: rooms of chat events plus who is typing.
+// Claude Coop relay: rooms of chat events, who is typing, the room's repo and its edit lock.
 // Run: node relay/server.mjs   (PORT env var, default 8787)
 import { createServer } from 'node:http'
 
 const TYPING_MS = 4000
-const KINDS = new Set(['prompt', 'answer', 'typing'])
+// A Claude editing the shared files holds the lock; one that vanishes loses it after this.
+const LOCK_MS = 15 * 60_000
+const KINDS = new Set(['prompt', 'answer', 'typing', 'repo', 'lock', 'unlock'])
 // ponytail: in-memory rooms, lost on restart; add a JSON file or SQLite when rooms must persist.
 const rooms = new Map()
 
@@ -30,8 +32,9 @@ createServer(async (req, res) => {
     const since = Math.max(0, Number(url.searchParams.get('since')) || 0)
     const now = Date.now()
     const typing = [...room.typing].filter(([, at]) => now - at < TYPING_MS).map(([who]) => who)
+    const lock = room.lock && now - room.lock.at < LOCK_MS ? room.lock.holder : null
     // total lets a client notice the relay restarted under it and start over.
-    return send(res, 200, { events: room.events.slice(since), typing, total: room.events.length })
+    return send(res, 200, { events: room.events.slice(since), typing, total: room.events.length, repo: room.repo ?? null, lock })
   }
 
   if (req.method !== 'POST') return send(res, 405, { error: 'GET or POST' })
@@ -48,7 +51,7 @@ createServer(async (req, res) => {
   }
   const { from, kind, text = '', images = [] } = event
   if (typeof from !== 'string' || !from || from.length > 40 || !KINDS.has(kind) || typeof text !== 'string') {
-    return send(res, 400, { error: 'need from, kind (prompt|answer|typing), text' })
+    return send(res, 400, { error: `need from, kind (${[...KINDS].join('|')}), text` })
   }
   // Screenshot previews: up to 4 small base64 JPEGs.
   if (!Array.isArray(images) || images.length > 4 || !images.every(isPreview)) {
@@ -57,6 +60,23 @@ createServer(async (req, res) => {
 
   if (kind === 'typing') {
     room.typing.set(from, Date.now())
+    return send(res, 200, {})
+  }
+  // The room's shared workspace: a git URL everyone works from.
+  if (kind === 'repo') {
+    if (text.length > 500) return send(res, 400, { error: 'repo URL too long' })
+    room.repo = text || undefined
+    return send(res, 200, {})
+  }
+  // Taking the lock again (to keep it) is fine; taking someone else's live lock is not.
+  if (kind === 'lock') {
+    const held = room.lock && Date.now() - room.lock.at < LOCK_MS && room.lock.holder !== from
+    if (held) return send(res, 409, { holder: room.lock.holder })
+    room.lock = { holder: from, at: Date.now() }
+    return send(res, 200, {})
+  }
+  if (kind === 'unlock') {
+    if (room.lock?.holder === from) room.lock = undefined
     return send(res, 200, {})
   }
   room.typing.delete(from)

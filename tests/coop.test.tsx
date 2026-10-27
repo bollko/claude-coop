@@ -166,3 +166,62 @@ test('screenshots and picked files go to your Claude as paths, and the room hear
   expect(JSON.parse(posts.at(-1) ?? '{}').text).toBe('📎 notes.txt, log.csv')
   await pane.unmount()
 })
+
+test('with a room repo: the folder moves to the room branch, turns pull then push, a peer holding the lock waits', async ($, on) => {
+  const clock = mock.clock(on)
+  mock.store(on)
+  const repo = 'https://github.com/team/app'
+  const gitCalls: string[] = []
+  let lockHolder: string | null = null
+  on('command.register', () => ({ value: { command: 'coop' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('ui.status', () => ({ value: undefined }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('process.run', (_, e) => {
+    const cmd = e.argv.slice(1).join(' ')
+    gitCalls.push(cmd)
+    const out = (exitCode: number, stdout = '') => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+    if (cmd === 'remote get-url origin') return out(0, 'git@github.com:team/app.git\n')
+    if (cmd === 'branch --show-current') return out(0, 'main\n')
+    if (cmd.startsWith('rev-parse')) return out(1)
+    // Something changed this turn.
+    if (cmd === 'diff --cached --quiet') return out(1)
+    return out(0)
+  })
+  on('http.fetch', (_, e) => {
+    const ok = (text: unknown, status = 200) => ({ value: { status, ok: status < 300, headers: {}, text: JSON.stringify(text) } })
+    if (e.init?.method !== 'POST') return ok({ events: [], typing: [], total: 0, repo, lock: lockHolder })
+    const body = JSON.parse(e.init.body ?? '{}') as { kind: string }
+    if (body.kind === 'lock' && lockHolder && lockHolder !== 'Euan') return ok({ holder: lockHolder }, 409)
+    if (body.kind === 'lock') lockHolder = 'Euan'
+    if (body.kind === 'unlock') lockHolder = null
+    return ok({})
+  })
+  on('prompt.submit', (_, e) => ({ text: e.text }))
+  on('turn.complete', (_, e) => ({ text: e.answer }))
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.command.run({ command: 'coop', args: 'join http://relay room s Euan', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 120 } })
+  await clock.advance(1100)
+  expect(gitCalls).toContain('switch -c coop/room')
+  expect(gitCalls).toContain('push -u origin coop/room')
+
+  gitCalls.length = 0
+  await $.prompt.submit({ text: 'add a logout button', wait: false, origin: { kind: 'composer' } })
+  expect(lockHolder).toBe('Euan')
+  expect(gitCalls).toEqual(['pull --rebase --autostash origin coop/room'])
+  await $.turn.complete({ answer: 'Done', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
+  expect(gitCalls.slice(1)).toEqual([
+    'add -A',
+    'diff --cached --quiet',
+    'commit -m coop(Euan): add a logout button',
+    'push origin coop/room',
+  ])
+  expect(lockHolder).toBeNull()
+
+  // Jason's Claude is editing: Euan's prompt is held back with a reason.
+  lockHolder = 'Jason'
+  const res = await $.prompt.submit({ text: 'rename the button', wait: false, origin: { kind: 'composer' } })
+  expect(res).toEqual({ drop: "Jason's Claude is editing the shared files. Send again when it finishes." })
+})
