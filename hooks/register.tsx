@@ -681,6 +681,8 @@ let lastTurnId = ''
 // so the pane puts the peers' turns ahead of the text itself.
 // ponytail: inline note shows in the transcript; move it to $.session.append once this build ships it.
 const sendFromPane = async ($: EngineInterface, text: string) => {
+  // The engine won't let a plugin send text that starts with /: it would run a command as the person.
+  if (text.trimStart().startsWith('/')) return $.ui.toast('Slash commands only work in the main prompt box, not the Co-op pane.')
   const attached = await read($, shots)
   // A peer editing the shared files: keep the draft's attachments and say so.
   const busy = await beginTurn($, text || attached.map(a => a.name).join(', '))
@@ -694,7 +696,19 @@ const sendFromPane = async ($: EngineInterface, text: string) => {
   paneText = [text.trim(), marker].filter(Boolean).join('\n')
   paneImages = attached.flatMap(s => (s.preview ? [s.preview] : []))
   const full = withShots(text, attached.map(s => s.path))
-  await $.prompt.submit(note ? { text: `${note}\n\n---\n\n${name} says:\n${full}` } : { text: full, asUser: true })
+  try {
+    await $.prompt.submit(note ? { text: `${note}\n\n---\n\n${name} says:\n${full}` } : { text: full, asUser: true })
+  } catch (err) {
+    // Refused: give back the attachments and the edit lock, and say why.
+    paneText = undefined
+    paneImages = []
+    await update($, shots, () => attached)
+    if (holding) {
+      holding = undefined
+      await post($, 'unlock')
+    }
+    $.ui.toast(`coop: couldn't send that: ${String(err).replace(/^Error: /, '').slice(0, 300)}`)
+  }
 }
 
 export const register: Register = on => {
